@@ -106,35 +106,110 @@ local function decode_target_temp(b)
 end
 
 -- ============================================================
+-- Timer flags 解码: bitmask → 小时数（HomeOps Timer Flags）
+--   0x01=15min 0x02=30min 0x04=1h 0x08=2h 0x10=4h 0x20=8h 0x40=16h 0x80=无效
+-- ============================================================
+local function decode_timer(b)
+    if b == 0x80 or b == 0x00 then return nil end
+    local t = 0
+    local map = { [0x01] = 0.25, [0x02] = 0.5, [0x04] = 1, [0x08] = 2,
+                  [0x10] = 4, [0x20] = 8, [0x40] = 16 }
+    for flag, hours in pairs(map) do
+        if (b & flag) ~= 0 then t = t + hours end
+    end
+    return t
+end
+
+-- ============================================================
 -- C0 应答 32 字节字段解码（HomeOps PROTOCOL.md Receive Messages）
 -- byte 偏移全部 1-indexed（Lua string.byte 从 1 开始）
 --
--- 注意: operation_mode (byte9) 智谷美的实测值与 HomeOps 枚举不完全匹配，
---       这里先输出 raw 值，后面差分分析再补枚举映射
+-- 全字段清单（按 offset 顺序）:
+--   byte1=AA(帧头)  byte2=cmd  byte3=dir(0x00或0x80)  byte4=dest_id
+--   byte5=src_id  byte6=dest_id(重复)  byte7=Unknown1(capability related)
+--   byte8=Capabilities  byte9=op_mode  byte10=fan_mode
+--   byte11=target_temp(含bit6状态位)  byte12=T1室内  byte13=T2盘管
+--   byte14=T2B盘管排  byte15=T3室外  byte16=电流(常0xFF)
+--   byte17=Unknown2  byte18=Timer Start  byte19=Timer Stop
+--   byte20=压缩机运行标志  byte21=ModeFlags  byte22=OperationFlags
+--   byte23=E1故障码  byte24=E2故障码  byte25=保护状态低(0x02=DEFROST)
+--   byte26=保护状态高  byte27=CCM通信错误
+--   byte28-29=未知(候选EEV 16-bit LE步数)  byte30=未知  byte31=CRC  byte32=0x55
 -- ============================================================
 local function decode_c0_fields(raw)
     return {
-        -- byte 偏移 (1-indexed)  字段名
-        op_mode         = raw:byte(9),    -- byte8: 运行模式
-        fan_mode        = raw:byte(10),   -- byte9: 风速 (bit7=AUTO, low4=实际速度)
-        target_temp_raw = raw:byte(11),   -- byte10: 设定温度 raw (含 bit6 状态位)
+        -- === 头部（byte1~byte6 已被 codec 提取为 ftype/unit_id，这里不解） ===
+
+        -- byte7: Unknown1 (HomeOps: 可能 0x30 capability related)
+        unknown_1 = raw:byte(7),
+
+        -- byte8: Capabilities (HomeOps: 0x80=EXTERNAL_TEMP, 0x10=SWING)
+        caps        = raw:byte(8),
+        caps_sw     = (raw:byte(8) & 0x10) ~= 0,   -- 支持摆风
+        caps_extemp = (raw:byte(8) & 0x80) ~= 0,   -- 支持 Follow-Me
+
+        -- byte9: operation_mode
+        op_mode = raw:byte(9),
+
+        -- byte10: fan_mode (bit7=AUTO, low4=实际速度)
+        fan_mode   = raw:byte(10),
+        fan_auto   = (raw:byte(10) & 0x80) ~= 0,
+        fan_speed  = raw:byte(10) & 0x0F,
+
+        -- byte11: target_temp (含 bit6=0x40 状态位)
+        target_temp_raw = raw:byte(11),
         target_temp     = decode_target_temp(raw:byte(11)),
-        t1_temp         = decode_temp(raw:byte(12)),   -- byte11: T1 室内
-        t2_temp         = decode_temp(raw:byte(13)),   -- byte12: T2 盘管
-        t2b_temp        = decode_temp(raw:byte(14)),   -- byte13: T2B 盘管排
-        t3_temp         = decode_temp(raw:byte(15)),   -- byte14: T3 室外
-        current         = raw:byte(16),   -- byte15: 电流 (常为 0xFF)
-        compressor_run  = raw:byte(20),   -- byte19: 压缩机运行标志 (0x01=run)
-        mode_flags      = raw:byte(21),   -- byte20: ECO/AUX/SWING
-        op_flags        = raw:byte(22),   -- byte21: WATER_PUMP(0x04)/WATER_LOCK(0x80)
-        err_flags_low   = raw:byte(23),   -- byte22: E1 故障码
-        err_flags_high  = raw:byte(24),   -- byte23: E2 故障码
-        prot_flags_low  = raw:byte(25),   -- byte24: 保护状态低 (0x02=DEFROST)
-        prot_flags_high = raw:byte(26),   -- byte25: 保护状态高
-        unknown_4       = raw:byte(27),   -- byte26: CCM 通信错误标志
-        unknown_5       = raw:byte(28),   -- byte27: 未知（硬件相关）
-        unknown_6       = raw:byte(29),   -- byte28: 候选 EEV 低字节
-        unknown_7       = raw:byte(30),   -- byte29: 候选 EEV 高字节
+
+        -- byte12~15: 温度传感器
+        t1_temp  = decode_temp(raw:byte(12)),
+        t2_temp  = decode_temp(raw:byte(13)),
+        t2b_temp = decode_temp(raw:byte(14)),
+        t3_temp  = decode_temp(raw:byte(15)),
+
+        -- byte16: 电流（常为 0xFF，IDU 侧不量电流）
+        current = raw:byte(16),
+
+        -- byte17: Unknown2
+        unknown_2 = raw:byte(17),
+
+        -- byte18~19: Timer Start / Stop（bitmask → 小时数）
+        timer_start     = raw:byte(18),
+        timer_start_h   = decode_timer(raw:byte(18)),
+        timer_stop      = raw:byte(19),
+        timer_stop_h    = decode_timer(raw:byte(19)),
+
+        -- byte20: 压缩机运行标志（0x01=run 现场观察性结论）
+        compressor_run = raw:byte(20),
+
+        -- byte21: Mode Flags
+        mode_flags = raw:byte(21),
+        mode_eco   = (raw:byte(21) & 0x01) ~= 0,
+        mode_aux   = (raw:byte(21) & 0x02) ~= 0,
+        mode_swing = (raw:byte(21) & 0x04) ~= 0,
+
+        -- byte22: Operation Flags
+        op_flags      = raw:byte(22),
+        op_waterpump  = (raw:byte(22) & 0x04) ~= 0,
+        op_waterlock  = (raw:byte(22) & 0x80) ~= 0,
+
+        -- byte23~24: 故障码
+        err_flags_low  = raw:byte(23),
+        err_flags_high = raw:byte(24),
+
+        -- byte25~26: 保护状态
+        prot_flags_low  = raw:byte(25),
+        prot_flags_high = raw:byte(26),
+        prot_defrost    = (raw:byte(25) & 0x02) ~= 0,   -- 已知 0x02=正在除霜
+
+        -- byte27: CCM 通信错误标志
+        ccm_err = raw:byte(27),
+
+        -- byte28~30: 未知（候选 EEV 位置: byte28 低 + byte29 高 = 16-bit LE）
+        byte28 = raw:byte(28),
+        byte29 = raw:byte(29),
+        byte30 = raw:byte(30),
+        -- 候选 EEV 步数（如果这两个字节真是 EEV）
+        eev_steps = raw:byte(28) | (raw:byte(29) << 8),
     }
 end
 
