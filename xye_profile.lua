@@ -28,50 +28,88 @@ M.UNIT_ORDER = UNIT_ORDER
 M.UNIT_INDEX = UNIT_INDEX
 M.UNIT_COUNT = #UNIT_ORDER
 
+-- ============================================================
+-- 每台内机的点位定义
+--
+-- 【地址计算公式】
+--   实际地址 = 该设备起始地址 + 段内偏移
+--
+-- 【各设备起始地址（IR_STRIDE=11 / DI_STRIDE=4）】
+--   unit     IR 起始     DI 起始
+--   0x08     0x0000      0x0000
+--   0x09     0x000B      0x0004
+--   0x0A     0x0016      0x0008
+--   0x0B     0x0021      0x000C
+--   0x0C     0x002C      0x0010
+--   0x0D     0x0037      0x0014
+--   0x0E     0x0042      0x0018
+--   0x0F     0x004D      0x001C
+--   0x28     0x0058      0x0020
+--   0x29     0x0063      0x0024
+--   0x2A     0x006E      0x0028
+--   系统级   0x0079 起   0x002C
+--
+-- 【段内偏移】（下表每条末尾的 +N 即此值）
+--   IR: +0 运行模式  +1 风扇模式  +2 设定温度原始  +3 室内回风
+--       +4 盘管温度  +5 盘管排温度  +6 故障标志    +7 保护状态
+--       +8 设备固有码 +9 运行态值A  +10 运行态值B
+--   DI: +0 水泵运行  +1 ECO节能   +2 电辅热      +3 摆风
+--
+-- 【举例】0x0A 的"盘管温度" = 0x0016 + 4 = IR 0x001A
+--         0x28 的"运行态值B" = 0x0058 + 10 = IR 0x0062
+--
+-- 注意：偏移由加载期 assign_offsets() 按表中顺序自动分配；
+--       增删/重排点位会使后续偏移顺延，务必同步更新上面的地址注释。
+-- ============================================================
+
 -- get(fields) 返回点位原始数值；scale 仅用于展示（寄存器值 ÷ scale = 物理量）
 -- src: "c0" 取 C0 应答字段 / "c1" 取 C1 应答字段
 M.unit_points = {
     -- ===== 输入寄存器 IR =====
-    { key = "op_mode",      cn = "运行模式",     kind = "IR", src = "c0",
+    { key = "op_mode",      cn = "运行模式",     kind = "IR", src = "c0",   -- IR+0
       get = function(f) return f.op_mode end },
-    { key = "fan_mode",     cn = "风扇模式",     kind = "IR", src = "c0",
+    { key = "fan_mode",     cn = "风扇模式",     kind = "IR", src = "c0",   -- IR+1
       get = function(f) return f.fan_mode end },
-    { key = "set_temp_raw", cn = "设定温度原始", kind = "IR", src = "c0",
+    { key = "set_temp_raw", cn = "设定温度原始", kind = "IR", src = "c0",   -- IR+2
       get = function(f) return f.target_temp_raw end },
-    { key = "t1_temp",      cn = "室内回风",     kind = "IR", src = "c0", scale = 10,
+    { key = "t1_temp",      cn = "室内回风",     kind = "IR", src = "c0", scale = 10,   -- IR+3
       get = function(f) return f.t1_temp end },
-    { key = "t2_temp",      cn = "盘管温度",     kind = "IR", src = "c0", scale = 10,
+    { key = "t2_temp",      cn = "盘管温度",     kind = "IR", src = "c0", scale = 10,   -- IR+4
       get = function(f) return f.t2_temp end },
-    { key = "t2b_temp",     cn = "盘管排温度",   kind = "IR", src = "c0", scale = 10,
+    { key = "t2b_temp",     cn = "盘管排温度",   kind = "IR", src = "c0", scale = 10,   -- IR+5
       get = function(f) return f.t2b_temp end },
-    { key = "fault",        cn = "故障标志",     kind = "IR", src = "c0",
+    { key = "fault",        cn = "故障标志",     kind = "IR", src = "c0",   -- IR+6
       get = function(f) return (f.err_flags_high or 0) * 256 + (f.err_flags_low or 0) end },
-    { key = "protect",      cn = "保护状态",     kind = "IR", src = "c0",
+    { key = "protect",      cn = "保护状态",     kind = "IR", src = "c0",   -- IR+7
       get = function(f) return (f.prot_flags_high or 0) * 256 + (f.prot_flags_low or 0) end },
-    { key = "device_code",  cn = "设备固有码",   kind = "IR", src = "c0",
+    { key = "device_code",  cn = "设备固有码",   kind = "IR", src = "c0",   -- IR+8
       get = function(f) return f.byte28 end },
-    { key = "c1_a",         cn = "运行态值A",    kind = "IR", src = "c1",
+    { key = "c1_a",         cn = "运行态值A",    kind = "IR", src = "c1",   -- IR+9
       get = function(f) return f.val_a end },
-    { key = "c1_b",         cn = "运行态值B",    kind = "IR", src = "c1",
+    { key = "c1_b",         cn = "运行态值B",    kind = "IR", src = "c1",   -- IR+10
       get = function(f) return f.val_b end },
 
     -- ===== 离散输入 DI =====
-    { key = "pump",         cn = "水泵运行",     kind = "DI", src = "c0",
+    { key = "pump",         cn = "水泵运行",     kind = "DI", src = "c0",   -- DI+0
       get = function(f) return f.op_waterpump and 1 or 0 end },
-    { key = "eco",          cn = "ECO节能",      kind = "DI", src = "c0",
+    { key = "eco",          cn = "ECO节能",      kind = "DI", src = "c0",   -- DI+1
       get = function(f) return f.mode_eco and 1 or 0 end },
-    { key = "aux",          cn = "电辅热",       kind = "DI", src = "c0",
+    { key = "aux",          cn = "电辅热",       kind = "DI", src = "c0",   -- DI+2
       get = function(f) return f.mode_aux and 1 or 0 end },
-    { key = "swing",        cn = "摆风",         kind = "DI", src = "c0",
+    { key = "swing",        cn = "摆风",         kind = "DI", src = "c0",   -- DI+3
       get = function(f) return f.mode_swing and 1 or 0 end },
 }
 
+-- 系统级共享点位（地址在内机点位之后）
+--   compressor_run → DI 0x002C
+--   t3_temp        → IR 0x0079
+--   ccm_err        → IR 0x007A
 M.system_points = {
-    { key = "compressor_run", cn = "压缩机运行",  kind = "DI", src = "c0",
+    { key = "compressor_run", cn = "压缩机运行",  kind = "DI", src = "c0",   -- DI 0x002C
       get = function(f) return (f.compressor_run == 1) and 1 or 0 end },
-    { key = "t3_temp",        cn = "室外温度",    kind = "IR", src = "c0", scale = 10,
+    { key = "t3_temp",        cn = "室外温度",    kind = "IR", src = "c0", scale = 10,   -- IR 0x0079
       get = function(f) return f.t3_temp end },
-    { key = "ccm_err",        cn = "CCM通信错误", kind = "IR", src = "c0",
+    { key = "ccm_err",        cn = "CCM通信错误", kind = "IR", src = "c0",   -- IR 0x007A
       get = function(f) return f.ccm_err end },
 }
 
