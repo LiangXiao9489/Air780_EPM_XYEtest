@@ -2,6 +2,9 @@
 
 require "sys"
 
+-- 外部硬件看门狗（Air153C，EPM 板 GPIO28），require 后自动启动喂狗 task
+require "ext_wdt"
+
 PROJECT = "test_XYE_bus_protocol"
 VERSION = "1.0.000"
 
