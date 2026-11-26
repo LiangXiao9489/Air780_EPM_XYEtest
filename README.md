@@ -63,12 +63,17 @@ PC 端用 Python 脚本模拟总线：
 ## 3. 代码结构
 
 ```
-main.lua            入口：初始化 listener、统计、点位打印
-xye_codec.lua       拆帧 + 校验 + 字段解码（纯函数，不碰硬件）
-xye_listener.lua    u1 串口旁听驱动（buffer 管理 + 调 codec）
-xye_profile.lua     unit_id / 字段 → Modbus 点位地址映射（纯数据 + 纯函数）
-.gitignore          忽略 _extra/
+main.lua                        入口：初始化 listener、统计、点位打印
+xye_protocol/
+    xye_codec.lua               拆帧 + 校验 + 字段解码（纯函数，不碰硬件）
+    xye_listener.lua            u1 串口旁听驱动（buffer 管理 + 调 codec）
+    xye_profile.lua             unit_id / 字段 → Modbus 点位地址映射（纯数据 + 纯函数）
+.gitignore                      忽略 _extra/
 ```
+
+> 三个协议模块已归入 `xye_protocol/` 目录，但 `require` 仍使用扁平名
+> （`require "xye_codec"` 等）——LuatOS 会按脚本名在 luadb 中查找，
+> 与参考工程 `board/board.lua` 用 `require "board"` 的方式一致。
 
 ### 3.1 数据流
 
