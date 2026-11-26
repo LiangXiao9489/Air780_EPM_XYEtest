@@ -10,8 +10,8 @@
 帧格式（实测 + HomeOps 文档）：
   轮询帧  16B  AA C0/C1 <dest_id> 00 80 ... <complement> <crc> 55
   C0应答  32B  AA C0 80 00 <src_id> 00 E0 14 <fields 24B> <crc> 55
-  C1应答  30B  AA C1 80 00 <src_id> 00 <status 22B> <crc> 55
-  AA短帧  10B  AA <cmd> <payload 6B> <crc> 55
+  C1应答  32B  AA C1 80 00 <src_id> 00 <status 24B> <crc> 55
+  AA短帧  10B  AA <cmd> <payload 6B> <crc> 55   （cmd = unit_id + 1）
 
 校验算法（两套数学等价，实现版本 A）：
   A) 1.md 现场验证版: sum(AA ... CRC) & 0xFF == 0xAA
@@ -214,6 +214,71 @@ local function decode_c0_fields(raw)
 end
 
 -- ============================================================
+-- C1 应答 32 字节结构化解码
+--   业务语义在现有资料中无定义（现场参考明确"待确认"），
+--   这里只做“可证实的结构提取”，用于 P3 差分定位字段。
+--
+-- 布局（实测 8 台设备交叉验证）:
+--   byte1=AA  byte2=C1  byte3=80  byte4=00  byte5=unit_id  byte6=00
+--   byte7=值A(与 AA 短帧 payload[2] 相同，已核实)
+--   byte8=sentinel(通常 0xFF)
+--   byte9=值B(与 AA 短帧 payload[3] 疑似同源，待同轮采样确认)
+--   byte10=sentinel(通常 0xFF)
+--   byte11..27=业务载荷(本批抓包全零)
+--   byte28=设备固有属性(与 C0 byte28 完全一致, 值域 0x08/0x0C/0x14/0x20/0x28)
+--   byte29-30=FF FF   byte31=CRC   byte32=55
+-- ============================================================
+local function bytes_to_hex(raw, from, to)
+    local parts = {}
+    for i = from, to do
+        parts[#parts + 1] = string.format("%02X", raw:byte(i))
+    end
+    return table.concat(parts, " ")
+end
+
+local function decode_c1_fields(raw)
+    return {
+        val_a       = raw:byte(7),    -- 与 AA payload[2] 相同（已核实）
+        val_b       = raw:byte(9),    -- 与 AA payload[3] 疑似同源（待确认）
+        sentinel_1  = raw:byte(8),
+        sentinel_2  = raw:byte(10),
+        dev_const   = raw:byte(28),   -- 设备固有属性（与 C0 byte28 一致）
+        payload_hex = bytes_to_hex(raw, 6, 30),   -- byte6..byte30 原值，供差分
+    }
+end
+
+-- ============================================================
+-- AA 短帧 10 字节结构化解码
+--   规则（从抓包推导，11/11 命中）: cmd = unit_id + 1
+--     0x09..0x10 → unit 0x08..0x0F
+--     0x29..0x2B → unit 0x28..0x2A
+--     0x00       → 全局帧（无 unit_id）
+--   payload 6 字节: [1]=固定头(0x02) [2]=C1 byte7(已核实) [3]=疑似 C1 byte9 [4..6]=00
+-- ============================================================
+local function decode_aa_fields(raw)
+    local cmd = raw:byte(2)
+    local unit_id = nil
+    if cmd >= 0x09 and cmd <= 0x10 then
+        unit_id = cmd - 1
+    elseif cmd >= 0x29 and cmd <= 0x2B then
+        unit_id = cmd - 1
+    end
+
+    local p1, p2, p3 = raw:byte(3), raw:byte(4), raw:byte(5)
+    local p4, p5, p6 = raw:byte(6), raw:byte(7), raw:byte(8)
+    local all_zero = (p1 == 0 and p2 == 0 and p3 == 0 and
+                      p4 == 0 and p5 == 0 and p6 == 0)
+
+    return {
+        cmd         = cmd,
+        unit_id     = unit_id,
+        p1 = p1, p2 = p2, p3 = p3, p4 = p4, p5 = p5, p6 = p6,
+        all_zero    = all_zero,
+        payload_hex = bytes_to_hex(raw, 3, 8),
+    }
+end
+
+-- ============================================================
 -- 主拆帧函数
 --   buffer: 累计的字节串（可能含 FE 前导、多帧、噪声）
 --   返回: frames (数组), remaining (未消费的尾部字节)
@@ -257,9 +322,14 @@ function _M.try_decode(buffer)
                 raw     = raw,
             }
 
-            -- 目前只解码 C0 应答字段
+            -- 字段解码（C0 语义已知；C1/AA 仅结构提取）
             if ftype == "C0_RESP" then
                 frame.fields = decode_c0_fields(raw)
+            elseif ftype == "C1_RESP" and #raw == 32 then
+                frame.fields = decode_c1_fields(raw)
+            elseif ftype == "AA" and #raw == 10 then
+                frame.fields = decode_aa_fields(raw)
+                frame.unit_id = frame.fields.unit_id   -- AA 的 unit_id 由 cmd 推导
             end
 
             frames[#frames + 1] = frame

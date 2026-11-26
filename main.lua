@@ -18,6 +18,7 @@ log.error("main", "====================================================")
 -- ========== XYE Listener 硬件测试 ==========
 local listener = require "xye_listener"
 local codec    = require "xye_codec"
+local profile  = require "xye_profile"
 
 -- 统计
 local total_frames = 0
@@ -26,7 +27,14 @@ local online_units = {}        -- unit_id -> { last_seen_tick, ftypes }
 local unknown_count = 0
 
 -- sink: 每收到一帧就回调
-local printed_units = {}   -- 已全量打印过字段的设备 unit_id
+local printed_units = {}   -- 已全量打印过 C0 字段的设备 unit_id
+local printed_c1    = {}   -- 已打印过 C1 结构的设备 unit_id
+local printed_aa    = {}   -- 已打印过的 AA 短帧 cmd
+
+-- Modbus 点位映射所需
+local latest      = {}     -- unit_id -> { c0 = fields, c1 = fields }
+local printed_pm  = {}     -- 已打印过 Modbus 点表的设备
+local printed_sys = false  -- 系统级点表是否已打印
 
 local function on_frame(frame)
     total_frames = total_frames + 1
@@ -79,6 +87,101 @@ local function on_frame(frame)
                 f.unknown_1, f.unknown_2, f.byte28, f.byte29, f.byte30, f.eev_steps))
             log.info("XYE", "  =========================================================")
         end
+
+        -- 每台设备第一次收到 C1_RESP 时打印结构化原始数据（语义待 P3 差分）
+        if frame.ftype == "C1_RESP" and frame.fields and not printed_c1[id] then
+            printed_c1[id] = true
+            local c = frame.fields
+            log.info("XYE", string.format("-------- C1_RESP 结构 单元ID=0x%02X --------", id))
+            log.info("XYE", string.format("  原始帧HEX: %s", codec.to_hex(frame.raw)))
+            log.info("XYE", string.format("  值A(byte7)=0x%02X  值B(byte9)=0x%02X  设备固有(byte28)=0x%02X  (sentinel b8=0x%02X b10=0x%02X)",
+                c.val_a, c.val_b, c.dev_const, c.sentinel_1, c.sentinel_2))
+            log.info("XYE", string.format("  payload原值(b6..b30): %s", c.payload_hex))
+            log.info("XYE", "  (语义未确认，待 P3 差分分析)")
+        end
+    end
+
+    -- AA 短帧：每个 cmd 只打印一次（cmd = unit_id + 1）
+    if frame.ftype == "AA" and frame.fields and not printed_aa[frame.fields.cmd] then
+        printed_aa[frame.fields.cmd] = true
+        local a = frame.fields
+        if a.unit_id then
+            log.info("XYE", string.format("-------- AA短帧 cmd=0x%02X → 单元ID=0x%02X --------", a.cmd, a.unit_id))
+        else
+            log.info("XYE", string.format("-------- AA短帧 cmd=0x%02X (全局帧) --------", a.cmd))
+        end
+        log.info("XYE", string.format("  原始帧HEX: %s", codec.to_hex(frame.raw)))
+        log.info("XYE", string.format("  payload原值: %s%s", a.payload_hex,
+            a.all_zero and "  (全零 = 该槽位空闲/无数据)" or ""))
+        if a.unit_id then
+            log.info("XYE", string.format("  标志=0x%02X  值A(payload[2]↔C1 byte7)=0x%02X  值B(payload[3])=0x%02X  尾=0x%02X 0x%02X 0x%02X",
+                a.p1, a.p2, a.p3, a.p4, a.p5, a.p6))
+        else
+            log.info("XYE", string.format("  标志=0x%02X  payload[2..6]=0x%02X 0x%02X 0x%02X 0x%02X 0x%02X",
+                a.p1, a.p2, a.p3, a.p4, a.p5, a.p6))
+        end
+    end
+
+    -- ===== Modbus 点位映射 =====
+    local uid = frame.unit_id
+    if uid and frame.fields then
+        local slot = latest[uid]
+        if not slot then
+            slot = {}
+            latest[uid] = slot
+        end
+        if frame.ftype == "C0_RESP" then
+            slot.c0 = frame.fields
+        elseif frame.ftype == "C1_RESP" then
+            slot.c1 = frame.fields
+        end
+
+        -- 每台内机：C0 + C1 都到齐后打印一次点位表
+        if slot.c0 and slot.c1 and not printed_pm[uid] then
+            printed_pm[uid] = true
+            log.info("PMAP", string.format("===== Modbus 点表 单元ID=0x%02X =====", uid))
+            for _, p in ipairs(profile.unit_points) do
+                local fields = (p.src == "c1") and slot.c1 or slot.c0
+                local addr = profile.unit_addr(p, uid)
+                if addr then
+                    local v = profile.point_value(p, fields)
+                    local vs
+                    if v == nil then
+                        vs = "(无数据)"
+                    elseif p.kind == "DI" then
+                        vs = (v == 1) and "1/是" or "0/否"
+                    elseif p.scale then
+                        vs = string.format("%d (÷%d=%.1f)", v, p.scale, v / p.scale)
+                    else
+                        vs = tostring(v)
+                    end
+                    log.info("PMAP", string.format("  %s[0x%04X] %s = %s", p.kind, addr, p.cn, vs))
+                end
+            end
+        end
+    end
+
+    -- 系统级共享点位：首次拿到任一 C0 帧后打印一次
+    if not printed_sys and frame.ftype == "C0_RESP" and frame.fields then
+        printed_sys = true
+        log.info("PMAP", "===== Modbus 点表（系统级共享）=====")
+        for _, p in ipairs(profile.system_points) do
+            local addr = profile.sys_addr(p)
+            local v = profile.point_value(p, frame.fields)
+            local vs
+            if v == nil then
+                vs = "(无数据)"
+            elseif p.kind == "DI" then
+                vs = (v == 1) and "1/是" or "0/否"
+            elseif p.scale then
+                vs = string.format("%d (÷%d=%.1f)", v, p.scale, v / p.scale)
+            else
+                vs = tostring(v)
+            end
+            log.info("PMAP", string.format("  %s[0x%04X] %s = %s", p.kind, addr, p.cn, vs))
+        end
+        log.info("PMAP", string.format("  地址空间: IR 共 %d 个, DI 共 %d 个",
+            profile.IR_TOTAL, profile.DI_TOTAL))
     end
 
     if frame.ftype:sub(1, 7) == "UNKNOWN" then
@@ -89,7 +192,7 @@ local function on_frame(frame)
     end
 end
 
-listener.set_sink(on_frame)
+listener.set_sink(on_frame) 
 listener.init()
 
 -- 每 5 秒打印一次统计
