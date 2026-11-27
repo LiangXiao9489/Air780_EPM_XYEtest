@@ -2,6 +2,12 @@
 
 require "sys"
 
+-- 硬件资源表（单板 EPM，写死）
+local board = require "board"
+
+-- 运行时配置（JSON 落盘）
+local config = require "config"
+
 -- 外部硬件看门狗（Air153C，EPM 板 GPIO28），require 后自动启动喂狗 task
 require "ext_wdt"
 
