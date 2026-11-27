@@ -2,17 +2,14 @@
 
 require "sys"
 
--- 硬件资源表（单板 EPM，写死）
-local board = require "board"
-
 -- 运行时配置（JSON 落盘）
 local config = require "config"
 
--- 点位缓存（单板 EPM）
+-- 点位缓存（单板 EPM，store.lua）
 local store = require "store"
 store.init()
 
--- 外部硬件看门狗（Air153C，EPM 板 GPIO28），require 后自动启动喂狗 task
+-- 外部硬件看门狗（Air153C，GPIO28）
 require "ext_wdt"
 
 PROJECT = "test_XYE_bus_protocol"
@@ -138,10 +135,16 @@ listener.init()
 bridge.start()
 
 -- ========== 4G 联网 + MQTT 上报链路 ==========
--- require 顺序：4G 初始化 → NTP 对时 → MQTT（basic 自动 require receiver/sender/topics → down → report/cfg/ota）
+-- require 顺序：4G 初始化 → NTP 对时 → MQTT basic（自动连 broker 并订阅）
 require "net_4g"
 require "sntp"
 require "basic"
+
+-- 设备支撑：状态灯（MQTT 连/断 → 常亮/快闪）+ 恢复出厂按键（长按 GPIO30 ×7s）
+require "net_led"
+require "reset_btn"
+
+log.info("main", "======== 全部模块加载完毕 ========")
 log.info("main", "MQTT 链路已加载，等待 SIM + 网络就绪 ...")
 
 -- 每 5 秒打印一次统计

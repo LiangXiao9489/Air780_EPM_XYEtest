@@ -40,7 +40,7 @@ local DEFAULT_CFG = {
     change_check_sec     = 5,    -- 变化数据检测周期（秒）
 
     -- 主动上行开关（默认关闭，由平台下发开启）
-    report_real_enable   = false,
+    report_real_enable   = true,
     report_change_enable = false,
 
     -- 写使能（MQTT 下发写点位闸门，暂保留口子）
