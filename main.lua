@@ -8,6 +8,10 @@ local board = require "board"
 -- 运行时配置（JSON 落盘）
 local config = require "config"
 
+-- 点位缓存（单板 EPM）
+local store = require "store"
+store.init()
+
 -- 外部硬件看门狗（Air153C，EPM 板 GPIO28），require 后自动启动喂狗 task
 require "ext_wdt"
 
@@ -23,6 +27,33 @@ log.error("main", "固件版本: " .. VERSION)
 log.error("main", "====================================================")
 log.error("main", "====================================================")
 
+-- ========== store 缓存层启动测试（临时，步骤3通过后删除） ==========
+log.info("store.test", "===== store 缓存层启动测试 =====")
+store.ensure_device(0x08)
+store.write_point(0x08, "op_mode", 1, 0)
+store.write_point(0x08, "t1_temp", 26, 0)
+store.write_point(0x08, "compressor_run", 1, 0)
+store.ensure_device(0x09)
+store.write_point(0x09, "op_mode", 0, 0)
+store.write_point(0x09, "t1_temp", 28, 0)
+store.write_point(0x09, "fault_code", 0, 0)
+log.info("store.test", "is_ready=", store.is_ready())
+log.info("store.test", "online_devices=", table.concat(store.get_online_devices(), ","))
+local vals = store.get_point_values()
+log.info("store.test", "get_point_values 返回条数=" .. #vals)
+for _, p in ipairs(vals) do
+    log.info("store.test", string.format("  dev=0x%02X tag=%-16s value=%s errcode=0x%02X ts=%s",
+        p.dev_id, p.tag, tostring(p.values and p.values[1]), p.errcode, tostring(p.ts)))
+end
+-- 测试离线
+store.write_device_offline(0x09, 0x0B)
+local v2 = store.get_point_values()
+local offline_count = 0
+for _, p in ipairs(v2) do
+    if p.dev_id == 0x09 and p.errcode == 0x0B then offline_count = offline_count + 1 end
+end
+log.info("store.test", string.format("离线测试: 0x09 设备 errcode=0x0B 的点位=%d", offline_count))
+log.info("store.test", "===== store 测试完成 =====")
 
 -- ========== XYE Listener 硬件测试 ==========
 local listener = require "xye_listener"
