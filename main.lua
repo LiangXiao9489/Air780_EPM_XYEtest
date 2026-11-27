@@ -137,6 +137,13 @@ listener.set_sink(on_frame)
 listener.init()
 bridge.start()
 
+-- ========== 4G 联网 + MQTT 上报链路 ==========
+-- require 顺序：4G 初始化 → NTP 对时 → MQTT（basic 自动 require receiver/sender/topics → down → report/cfg/ota）
+require "net_4g"
+require "sntp"
+require "basic"
+log.info("main", "MQTT 链路已加载，等待 SIM + 网络就绪 ...")
+
 -- 每 5 秒打印一次统计
 sys.timerLoopStart(function()
     log.error("XYE", string.format("===== 统计 tick=%d =====", mcu.ticks()))

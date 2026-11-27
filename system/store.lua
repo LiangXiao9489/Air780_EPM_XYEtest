@@ -26,7 +26,10 @@
 local _M = {}
 
 -- 错误码（与二合一保持，以后加 Modbus 时可直接复用）
-_M.ERR_UNINIT = 0x08   -- 未采集过（缓存状态标记）
+_M.ERR_UNINIT    = 0x08   -- 未采集过（缓存状态标记）
+_M.ERR_NOT_FOUND = 0x02   -- 点位不存在（set_by_tag 查不到 tag 时）
+_M.ERR_READONLY  = 0x04   -- 只读点位（set_by_tag 试图写只读 tag 时）
+_M.ERR_NOT_SUPPORTED = 0x06  -- 单板 EPM 无写穿透能力
 
 -- ============================================================
 -- 内部数据
@@ -112,6 +115,28 @@ function _M.get_online_devices()
     end
     table.sort(ids)
     return ids
+end
+
+-- 供 report.start_index_real 调用：判断 (dev_id, tag) 是否是有效点位
+-- 单板 EPM 没有 Modbus 地址映射层，所有在缓存里出现过的 tag 都算有效
+-- 返回一个 truthy 值即可（Modbus 场景下是寄存器地址，这里用 tag 本身）
+function _M.get_reg_by_tag(dev_id, tag)
+    local dev = cache[dev_id]
+    if dev and dev[tag] then
+        return tag
+    end
+    return nil
+end
+
+-- down.lua 调用：按 tag 找内部 slot（只读缓存，返回 nil 表示"不支持"）
+function _M.get_slot_by_tag(dev_id, tag)
+    return nil, _M.ERR_NOT_SUPPORTED
+end
+
+-- down.lua 调用：写点位（单板 EPM 是监听-only，不支持下发写入）
+-- 留接口口子，以后加 Modbus 写穿透时在这里实现
+function _M.set_by_tag(dev_id, tag, num_val)
+    return false, _M.ERR_NOT_SUPPORTED
 end
 
 -- ============================================================
