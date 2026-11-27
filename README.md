@@ -1,45 +1,78 @@
-# Air780EPM XYE 总线旁听工程
+# Air780EPM XYE 总线 IoT 网关
 
 > 在银尔达 Air780EPM 模组上，通过 RS-485 **只读旁听**智谷美的 XYE 空调总线，
-> 提取在线室内机及其运行参数，并映射为 Modbus 点位。
+> 采集在线室内机运行参数 → 本地缓存 → MQTT 上报云端，支持 OTA 和远程配置。
 >
-> 当前阶段：**纯只读**，不向总线发送任何字节。
+> 当前阶段：**纯只读采集 + 上报**，不向总线发送任何字节，不控制空调。
 
 ---
 
-## 1. 工程目标
+## 目录
 
-| 目标 | 说明 |
-|---|---|
-| 旁听 | 挂在 XYE 总线上，只收不发，不影响原有 CCM 主站轮询 |
-| 拆帧 | 从连续字节流中切出完整 XYE 帧并校验 |
-| 解码 | 解析室内机状态、温度、故障等参数 |
-| 映射 | 将解析结果映射成 Modbus 离散输入（DI）/ 输入寄存器（IR） |
-| 可移植 | 核心模块不依赖具体板型/网关，可整体搬走 |
-
-**非目标（当前阶段不做）**
-
-- 写入 / 控制室内机（XYE 0xC3 SET）
-- 替代原 CCM 主站
-- 多协议网关
+- [1. 工程功能](#1-工程功能)
+- [2. 硬件与引脚](#2-硬件与引脚)
+- [3. 代码结构](#3-代码结构)
+- [4. 启动流程](#4-启动流程)
+- [5. 数据流](#5-数据流)
+- [6. MQTT 协议](#6-mqtt-协议)
+- [7. 运行时配置](#7-运行时配置)
+- [8. OTA 与状态灯](#8-ota-与状态灯)
+- [9. XYE 协议要点](#9-xye-协议要点)
+- [10. C0 应答字段解码](#10-c0-应答字段解码)
+- [11. C1 / AA 帧说明](#11-c1--aa-帧说明)
+- [12. 离线判定](#12-离线判定)
+- [13. 为后续扩展预留](#13-为后续扩展预留)
+- [14. 已知坑](#14-已知坑)
+- [15. 参考资料](#15-参考资料)
 
 ---
 
-## 2. 硬件与环境
+## 1. 工程功能
 
-### 2.1 模组与串口
+| 功能 | 说明 | 状态 |
+|---|---|---|
+| XYE 旁听 | RS-485 UART1 4800 8N1 只收不发，不影响原有 CCM 主站轮询 | ✅ 已实现 |
+| 帧解码 | C0/C1/AA 三类帧拆帧 + CRC 校验 + 字段解码 | ✅ 已实现 |
+| 本地缓存 | 所有在线室内机全部参数动态缓存在 RAM，支持离线判定 | ✅ 已实现 |
+| 4G 联网 | SIM 卡自动识别，APN 自动获取，IP_READY 事件驱动 | ✅ 已实现 |
+| MQTT 上报 | 整点全量 (real) + 变化检测 (change) + 平台触发快速上报 (realIndex) | ✅ 已实现 |
+| NTP 对时 | IP_READY 后自动对时，时间有效性门控防止假时间戳上报 | ✅ 已实现 |
+| 远程配置 | 平台下发参数 set/get，落盘 `/gateway_cfg.json` 重启不丢 | ✅ 已实现 |
+| OTA 升级 | 远程下载固件升级 | ✅ 已实现 |
+| NET 状态灯 | GPIO27，MQTT 已连=常亮，离线=快闪 | ✅ 已实现 |
+| 恢复出厂 | GPIO30 长按 7 秒，删除配置文件 + 重启 | ✅ 已实现 |
+| 硬件看门狗 | GPIO28 连接 Air153C，每 120s 喂一次脉冲 | ✅ 已实现 |
+
+**暂未实现（预留接口）**
+
+- XYE 写入 / 控制室内机（0xC3 SET 帧）
+- Modbus 协议转换（tag → s_addr 映射层已预留口子）
+- Modbus 从站响应上位机
+
+---
+
+## 2. 硬件与引脚
+
+### 2.1 模组
 
 | 项 | 值 |
 |---|---|
 | 模组 | 银尔达 Air780EPM（`Air780EPM_A12`） |
-| 串口 | **u1**（uart1） |
-| 波特率 | **4800**，8N1，半双工 |
-| 方向脚 | GPIO25，`en_level = 0`（旁听模式下只收不发，方向脚实际不参与） |
+| LuaOS 版本 | base 26.04 |
 
-> u1 是例程中网关接从机的口，u2 通常对上位机，此分配保持不变。
-> XYE 必须独占一路 485，不能与 Modbus 从机共口。
+### 2.2 引脚分配
 
-### 2.2 接线
+| 引脚 | 功能 | 方向 | 备注 |
+|---|---|---|---|
+| **UART1 X** | RS-485 A | — | 4800 8N1 半双工 |
+| **UART1 Y** | RS-485 B | — | — |
+| **UART1 E** | RS-485 GND | — | — |
+| **GPIO25** | RS-485 方向控制 | 输出 | 旁听模式固定低电平（只收不发） |
+| **GPIO27** | NET LED | 输出 | 高电平亮 |
+| **GPIO28** | Air153C 外部看门狗 | 输出 | 每 120s 发 250ms 脉冲 |
+| **GPIO30** | 恢复出厂按键 | 输入 | 内部上拉，按下=GND，长按 7s |
+
+### 2.3 接线
 
 ```
 Air780EPM u1          USB-485 转接器
@@ -50,80 +83,349 @@ Air780EPM u1          USB-485 转接器
 
 若不通，先对调 X / Y。
 
-### 2.3 测试环境
-
-PC 端用 Python 脚本模拟总线：
-
-- 选择 PC 的一个 USB-485 口
-- 按 `01_抓包` 中原始抓包的**真实时间间隔**回放帧数据
-- 可配置"从第 N 帧开始，发送 M 帧后停止"
-
 ---
 
 ## 3. 代码结构
 
 ```
-main.lua                        入口：初始化 listener、统计、点位打印
+main.lua                           启动入口：串起所有模块
+net_led.lua                        GPIO27 NET 状态灯（MQTT 连/断 → 常亮/快闪）
+reset_btn.lua                      GPIO30 长按 7s 恢复出厂
+system/
+  config.lua                       运行时配置 JSON 落盘 (/gateway_cfg.json)
+  store.lua                        轻量点位缓存（tag 字符串索引，无 Modbus 地址映射）
+  ext_wdt.lua                      GPIO28 Air153C 看门狗喂狗（写死引脚）
 xye_protocol/
-    xye_codec.lua               拆帧 + 校验 + 字段解码（纯函数，不碰硬件）
-    xye_listener.lua            u1 串口旁听驱动（buffer 管理 + 调 codec）
-    xye_profile.lua             unit_id / 字段 → Modbus 点位地址映射（纯数据 + 纯函数）
-.gitignore                      忽略 _extra/
+  xye_listener.lua                 UART1 旁听驱动（buffer 管理 + 调 codec）
+  xye_codec.lua                    拆帧 + 校验 + 字段解码（纯函数，零硬件依赖）
+  xye_bridge.lua                   XYE 帧 → store 缓存 + 离线判定（单板版）
+wireless/
+  4g/
+    net_4g.lua                     SIM 识别 + IP 状态监听 + DNS 设置
+    sntp.lua                       NTP 网络对时
+    net_watchdog.lua               网络看门狗（可选，当前未启用）
+  mqtt/
+    basic.lua                      broker.emqx.io 连接 + 自动重连 + 订阅
+    sender.lua                     异步发送队列
+    receiver.lua                   下行消息入队 + 独立 task 解析
+    protocol/
+      topics.lua                   MQTT topic 模板（带设备 UID）
+      up.lua                       上行报文组装（real/change/realIndex 格式）
+      ack.lua                      setack / indexRealAck 等下行应答构建
+      report.lua                   定时上报 task（整点 real + 周期 change + 快速上报）
+      cfg.lua                      远程配置 set/get 参数白名单 + 校验
+      down.lua                     下行指令分发（cfg.set / indexReal / ota 等）
+  ota.lua                          OTA 固件升级
+.gitignore                         忽略 _extra/、luadb/ 等
 ```
 
-> 三个协议模块已归入 `xye_protocol/` 目录，但 `require` 仍使用扁平名
-> （`require "xye_codec"` 等）——LuatOS 会按脚本名在 luadb 中查找，
-> 与参考工程 `board/board.lua` 用 `require "board"` 的方式一致。
+### 3.1 模块分类
 
-### 3.1 数据流
+| 层 | 模块 | 说明 |
+|---|---|---|
+| 入口 | `main.lua` | 唯一的启动顺序编排 |
+| 硬件支撑 | `ext_wdt` `net_led` `reset_btn` | 全部写死 EPM 引脚，不做板型切换 |
+| 配置 | `system/config.lua` | 单板 EPM，无点表选择、无串口切换 |
+| 数据层 | `system/store.lua` | 全工程唯一数据源，所有模块通过它读写点位 |
+| 采集层 | `xye_listener` `xye_codec` `xye_bridge` | UART → 字节流 → 帧 → 缓存 |
+| 联网层 | `4g/net_4g` `4g/sntp` | SIM → IP → 时间同步 |
+| MQTT 核心 | `mqtt/basic` `mqtt/sender` `mqtt/receiver` | 连接 + 队列 + 事件驱动 |
+| MQTT 协议 | `mqtt/protocol/*` | topic、payload 格式、指令解析、上报 |
+| OTA | `wireless/ota.lua` | 固件升级 |
 
+### 3.2 require 路径
+
+所有模块放在根目录或直接子目录下，用扁平名 require（LuatOS 按脚本名在 luadb 中查找）：
+
+```lua
+require "sys"
+require "config"          -- system/config.lua
+require "store"           -- system/store.lua
+require "ext_wdt"         -- system/ext_wdt.lua
+require "xye_listener"    -- xye_protocol/xye_listener.lua
+require "xye_codec"       -- xye_protocol/xye_codec.lua
+require "xye_bridge"      -- xye_protocol/xye_bridge.lua
+require "net_4g"          -- wireless/4g/net_4g.lua
+require "sntp"            -- wireless/4g/sntp.lua
+require "basic"           -- wireless/mqtt/basic.lua（basic 内部自动 require sender/receiver/topics/down/report/cfg/ota）
+require "net_led"         -- net_led.lua（根目录）
+require "reset_btn"       -- reset_btn.lua（根目录）
 ```
-uart1 收到字节
-   └→ listener: 追加到 buffer
-        └→ codec.try_decode(buffer)
-             ├→ 跳过噪声，找 0xAA 起点
-             ├→ 向后找最近的 0x55 终点（最长 32 字节）
-             ├→ 校验
-             ├→ 识别帧类型 + unit_id
-             └→ 按类型解码字段
-        └→ 回调 on_frame(frame)
-             ├→ 统计 / 在线设备
-             ├→ C0 全量字段打印
-             ├→ C1 结构打印
-             ├→ AA 短帧打印
-             └→ Modbus 点位表打印（PMAP）
-```
-
-### 3.2 关键模块职责
-
-**xye_codec.lua**（纯函数，零硬件依赖）
-
-| 函数 | 作用 |
-|---|---|
-| `try_decode(buffer)` | 拆帧，返回 `frames[], remaining` |
-| `identify_frame(raw)` | 按长度/命令字节判定帧类型 |
-| `get_unit_id(raw, ftype)` | 提取 unit_id |
-| `decode_c0_fields(raw)` | C0 应答字段解码（约 40 个键） |
-| `decode_c1_fields(raw)` | C1 应答**结构**提取（语义未定） |
-| `decode_aa_fields(raw)` | AA 短帧结构提取（cmd → unit_id） |
-| `checksum_ok(raw)` | 校验（两套公式等价） |
-| `to_hex(raw)` | 字节串转 HEX 字符串 |
-
-**xye_profile.lua**（纯数据，零硬件依赖）
-
-| 接口 | 作用 |
-|---|---|
-| `unit_points` | 每台内机的点位定义（IR + DI） |
-| `system_points` | 系统级共享点位 |
-| `unit_addr(p, unit_id)` | 内机点位地址 |
-| `sys_addr(p)` | 系统点位地址 |
-| `point_value(p, fields)` | 取点位整数值（IR 按 scale 缩放） |
 
 ---
 
-## 4. XYE 协议要点
+## 4. 启动流程
 
-### 4.1 帧格式
+```
+sys 内核初始化
+  │
+  ├─ pm.ioVol(3300)
+  │
+  ├─ config.load_or_init()          ← 读 /gateway_cfg.json，没有则写默认值
+  ├─ store.init()                    ← 空初始化，等 XYE 帧到了再 ensure_device
+  │
+  ├─ ext_wdt 喂狗 task 自启
+  │
+  ├─ xye_listener.init()             ← UART1 4800 8N1 + en_pin=25
+  ├─ xye_bridge.start()              ← 离线判定 task 自启
+  │
+  ├─ net_4g 自启                     ← SIM RDY 监听 + IP_READY 监听
+  ├─ sntp 自启                       ← 等 IP_READY 后对时
+  ├─ basic 自启                      ← 等 IP_READY 后连 broker.emqx.io
+  │     └─ 内部自动 require:
+  │          receiver（下行队列 task）
+  │          sender（发送队列 task）
+  │          topics（topic 模板）
+  │          down（下行指令分发）
+  │          cfg（远程配置）
+  │          report（定时上报 task）
+  │          ota（OTA 注册）
+  │
+  ├─ net_led task 自启               ← 订阅 MQTT_CONNECTED / DISCONNECTED
+  ├─ reset_btn task 自启             ← 100ms 采样 GPIO30
+  │
+  ├─ 5s 统计定时器                   ← 总帧数 / 在线设备 / store 缓存数
+  │
+  └─ sys.run()
+```
+
+---
+
+## 5. 数据流
+
+```
+┌─────────── UART1 4800 8N1 ───────────┐
+│                                       │
+│  CCM 主站轮询 XYE 总线                │
+│  (listener 只收不发，方向脚固定低)     │
+│                                       │
+└───────────────┬───────────────────────┘
+                │ 字节流
+                ▼
+┌──────────────────────────────┐
+│ xye_listener.lua             │
+│ buffer 管理 + try_decode()   │
+└──────────────┬───────────────┘
+               │ frames[]
+               ▼
+┌──────────────────────────────┐
+│ xye_codec.lua                │
+│ CRC 校验 → 识别 ftype +      │
+│ unit_id → decode C0/C1/AA   │
+│ （纯函数，零硬件依赖）        │
+└──────────────┬───────────────┘
+               │ frame{unit_id, ftype, fields, raw}
+               ▼
+┌──────────────────────────────┐
+│ xye_bridge.lua               │
+│ C0_RESP → store.ensure_device│
+│         → store.write_point  │
+│ C1_RESP → 只作在线依据        │
+│ C0_POLL / AA → 忽略          │
+│ 45s 超时 → store.write_      │
+│   device_offline             │
+└──────────────┬───────────────┘
+               │
+               ▼
+┌──────────────────────────────┐
+│ system/store.lua             │
+│ cache[unit_id][tag] = {      │
+│   value, errcode, ts         │
+│ }                            │
+│ tag 用字符串：               │
+│ "op_mode" "t1_temp" ...      │
+└──────────────┬───────────────┘
+               │ get_point_values()
+               ▼
+┌──────────────────────────────┐
+│ wireless/mqtt/protocol/      │
+│ report.lua                   │
+│ 整点 real 全量 / 周期 change │
+│ 快速上报 realIndex           │
+└──────────────┬───────────────┘
+               │ sender.publish(topics.UP_DATA, payload, 1)
+               ▼
+┌──────────────────────────────┐
+│ wireless/mqtt/basic.lua      │
+│ broker.emqx.io:1883         │
+│ CLIENT_ID = YEDtest_EPM_     │
+│   mqtt_<UID>                 │
+└──────────────────────────────┘
+```
+
+### store 内部数据结构
+
+```lua
+-- tag 用字符串（"op_mode" / "t1_temp" / "compressor_run" ...）
+-- 以后加 Modbus 协议转换时，只需加一层 tag → s_addr 的映射表
+-- 缓存层本身完全不动
+
+cache[unit_id][tag] = {
+    value   = 数值,       -- 实际温度/模式值等
+    errcode = 0,          -- 0=正常, 其他=错误码（离线=0x0B）
+    ts      = os.time(),  -- 采集时的 unix 秒时间戳
+}
+```
+
+### store 对外 API
+
+| API | 说明 |
+|---|---|
+| `store.init()` | 空初始化 |
+| `store.is_ready()` | 缓存层就绪状态 |
+| `store.ensure_device(unit_id)` | 新设备登记 |
+| `store.write_point(unit_id, tag, value, errcode)` | 写一个点位 |
+| `store.write_device_offline(unit_id, errcode)` | 离线：所有点写同一个 errcode |
+| `store.read_point(unit_id, tag)` | 读一个点位 |
+| `store.get_online_devices()` | 当前有数据的 unit_id 列表 |
+| `store.get_point_values()` | 返回所有点位（report 依赖，格式对齐二合一） |
+| `store.get_reg_by_tag(dev_id, tag)` | 判断 (dev_id, tag) 是否有效（report.start_index_real 依赖） |
+| `store.get_slot_by_tag(dev_id, tag)` | 单板 EPM 返回 nil（监听-only） |
+| `store.set_by_tag(dev_id, tag, val)` | 返回 false, ERR_NOT_SUPPORTED（监听-only，口子留着） |
+
+---
+
+## 6. MQTT 协议
+
+### 6.1 连接参数
+
+| 项 | 值 |
+|---|---|
+| broker | `broker.emqx.io:1883` |
+| CLIENT_ID | `YEDtest_EPM_mqtt_<UID>`（UID = `mcu.unique_id():toHex()`） |
+| 订阅 | `/s/<UID>` `/s2/<UID>` `/scr/<UID>` |
+| 发布上行 | `/d/<UID>` |
+| QoS | 0 |
+
+> 部署参数在 `wireless/mqtt/basic.lua` 顶部硬编码，现场修改即可。
+
+### 6.2 上行报文
+
+#### real（整点全量）
+
+对齐 5 分钟整点（由 `config.upload_interval_min` 控制），`report_real_enable=true` 时才发。
+
+```json
+{
+  "t": "real",
+  "ti": "2026-11-27 16:45:00",
+  "d": {
+    "8": {
+      "op_mode":    {"q": "1", "t": "1795769100", "v": "168"},
+      "t1_temp":    {"q": "1", "t": "1795769100", "v": "25.00000"},
+      "compressor_run": {"q": "1", "t": "1795769100", "v": "1"}
+    },
+    "9": { ... }
+  }
+}
+```
+
+| 字段 | 含义 |
+|---|---|
+| `t` | 上报类型：`real` / `change` / `realIndex` |
+| `ti` | 总时间戳（整点对齐，`YYYY-MM-DD HH:MM:SS`） |
+| `d` | 按设备聚合，key 是 unit_id 的字符串（如 `"8"` = 0x08） |
+| `q` | 质量位：`"1"`=正常，`"0"`=采集失败（服务端只存储 q=1 的数据） |
+| `t` | 点位时间戳（unix 秒字符串） |
+| `v` | 值（字符串形式，温度保留 5 位小数） |
+
+#### change（变化检测）
+
+每 `config.change_check_sec` 秒对比一次快照，有变化就发。`report_change_enable=true` 时才发。只包含有变化的 tag。
+
+#### realIndex（快速上报）
+
+由平台通过 `/scr/<UID>` 下发指令触发，立即上报一次后按指定周期持续上报 N 秒，用于"首页快速刷新"等场景。
+
+### 6.3 时间有效性门控
+
+NTP 校时前 `os.time()` 停在 2000-01-01，上报 task 里硬编码 `TIME_VALID_MIN = 1600000000`（2020-09-13），未校时前所有上报函数直接 return，不会发假时间戳。
+
+### 6.4 下行指令
+
+平台通过订阅的 topic 下发指令，`mqtt/protocol/down.lua` 解析分发：
+
+| topic | type | 作用 |
+|---|---|---|
+| `/s/<UID>` | `cfg.set` | 写运行时配置参数 |
+| `/s/<UID>` | `cfg.get` | 读全部配置 / 指定参数 / 只读状态 |
+| `/s/<UID>` | `indexReal` | 触发 realIndex 快速上报 |
+| `/s2/<UID>` | `ota` | OTA 固件升级 |
+
+所有写参数都经过 `cfg.lua` 的**白名单 + 类型校验 + 范围校验**，不合法直接回 `fail:["param"]`。
+
+---
+
+## 7. 运行时配置
+
+配置文件位置：`/gateway_cfg.json`，首次启动自动写入默认值。
+
+### 7.1 默认参数
+
+| key | 默认值 | 类型 | 范围 | 说明 |
+|---|---|---|---|---|
+| `upload_interval_min` | `5` | number | 1~60 | real 整点上报间隔（分钟） |
+| `change_check_sec` | `5` | number | 1~60 | change 变化检测周期（秒） |
+| `report_real_enable` | `false` | bool | — | real 开关，默认关闭 |
+| `report_change_enable` | `false` | bool | — | change 开关，默认关闭 |
+| `write_through_en` | `true` | bool | — | MQTT 下发写点位闸门（暂未实现写入能力） |
+| `u1_baudrate` | `4800` | number | 1200~115200 | XYE 串口波特率（需重启） |
+| `u1_databits` | `8` | number | 5~8 | 数据位（需重启） |
+| `u1_stopbits` | `1` | number | 1~2 | 停止位（需重启） |
+| `u1_parity` | `"N"` | string | N/E/O | 校验位（需重启） |
+
+### 7.2 远程配置
+
+平台下发 JSON 格式指令（topic: `/s/<UID>`）：
+
+**读参数**
+```json
+{"t": "cfg", "d": {"get": ["upload_interval_min", "csq", "uptime_s"]}}
+```
+
+**写参数**
+```json
+{"t": "cfg", "d": {"set": {"report_real_enable": true, "change_check_sec": 10}}}
+```
+
+**恢复出厂**
+```json
+{"t": "cfg", "d": {"factory_reset": true}}
+```
+
+串口参数（`u1_*`）写成功后会落盘，但需要**手动重启**才生效（`cfg.lua` 会回 `need_reboot: true`）。
+
+---
+
+## 8. OTA 与状态灯
+
+### 8.1 NET 状态灯（GPIO27）
+
+| 状态 | 行为 | 触发事件 |
+|---|---|---|
+| 开机 / 离线 | **快闪**（100ms 周期：50ms 亮 + 50ms 灭） | 默认 |
+| MQTT 已连接 | **常亮** | `MQTT_CONNECTED` |
+| MQTT 断开 | **快闪** | `MQTT_DISCONNECTED` |
+
+事件由 `mqtt/basic.lua` 在 connect success / 任何异常断开时 publish。
+
+### 8.2 恢复出厂（GPIO30）
+
+| 条件 | 行为 |
+|---|---|
+| 按住 ≥ 7000ms | 调 `config.factory_reset()`：删 `/gateway_cfg.json` → 重启 |
+| 按住 3000ms | 日志提示"检测到长按，已按住 XXXXms" |
+| 松开（未达 7000ms） | 日志提示取消 |
+
+### 8.3 OTA
+
+`wireless/ota.lua` require 即自动注册：平台通过 `/s2/<UID>` 下发 OTA 指令 → 下载固件 → 校验 → 升级 → 重启。具体参数见二合一工程 `wireless/ota.lua`。
+
+---
+
+## 9. XYE 协议要点
+
+### 9.1 帧格式
 
 所有帧以 `0xAA` 开头，以 `0x55` 结尾，CRC 位于**倒数第二字节**：
 
@@ -134,50 +436,39 @@ uart1 收到字节
 | 帧类型 | 长度 | 形态 |
 |---|---|---|
 | C0 轮询 | 16 B | `AA C0 <...> <crc> 55` |
-| C0 应答 | 32 B | `AA C0 80 00 <unit_id> 00 E0 14 <fields> <crc> 55` |
+| C0 应答 | **32 B** | `AA C0 80 00 <unit_id> 00 E0 14 <fields> <crc> 55` |
 | C1 轮询 | 16 B | `AA C1 <unit_id> 00 80 <...> <crc> 55` |
 | C1 应答 | **32 B** | `AA C1 80 00 <unit_id> 00 <status 24B> <crc> 55` |
 | AA 短帧 | 10 B | `AA <cmd> <payload 6B> <crc> 55` |
 
-> ⚠️ 1.md 中记录" C1 应答 30 字节"，实测为 **32 字节**，按 32 字节校验全部通过，判定为文档笔误。
+> 早期文档写"C1 应答 30 字节"，实测为 **32 字节**，按 32 字节校验全部通过，判定为文档笔误。
 
-### 4.2 校验算法（两套写法，数学等价）
+### 9.2 校验算法
 
 设帧为 `AA ... <CRC> <55>`：
-
-**版本 A（1.md 现场验证版）**
 
 ```
 sum(AA ... CRC) & 0xFF == 0xAA
 ```
 
-**版本 B（HomeOps 文档版）**
+注意：**校验范围止于 CRC，不含末尾 0x55**。含进去会导致全部帧校验失败。
 
-```
-CRC == 0xFF - (sum(AA ... CRC前一字节) & 0xFF)
-```
-
-两套等价的原因：`sum_all`（含末尾 0x55）恒为 0xFF，故 `sum_noCRC = 0xFF - 0x55 = 0xAA`。
-
-**已踩过的坑**：早期实现把末尾 `0x55` 也计入 sum，导致 `sum_all = 0xFF ≠ 0xAA`，全部帧校验失败。正确做法是**校验范围止于 CRC，不含 0x55**。
-
-### 4.3 轮询节奏
+### 9.3 轮询节奏
 
 每一轮由 CCM 主站发起，共 **109 帧**：
 
 | 组成 | 帧数 | 说明 |
 |---|---|---|
 | C0 轮询 | 64 | 对 0x00~0x3F 全部 unit_id 点名 |
-| C0 应答 | 11 | 只有在线的 11 台应答 |
+| C0 应答 | 11 | 只有在线的室内机应答 |
 | C1 轮询 | 11 | 只对在线设备发 |
 | C1 应答 | 11 | 对应 C1 轮询 |
 | AA 短帧 | 12 | 11 台设备各 1 帧 + 1 帧 `AA 00` 全局帧 |
 | **合计** | **109** | 周期约 **13.45 s**，轮间静默约 1.82 s |
 
-> C0 轮询会对 0x00~0x3F 全扫，因此 `C0_POLL` 数量远多于其他类型，属正常现象。
-> 判断设备是否在线，只能依据 **C0_RESP / C1_RESP**（应答帧），不能依据轮询帧里的 unit_id。
+**重要**：判断设备是否在线，**只能依据 C0_RESP / C1_RESP 应答帧**，不能依据轮询帧里的 unit_id。
 
-### 4.4 在线设备清单（现场实测 11 台）
+### 9.4 在线设备清单（现场实测）
 
 ```
 0x08 0x09 0x0A 0x0B 0x0C 0x0D 0x0E 0x0F
@@ -186,52 +477,7 @@ CRC == 0xFF - (sum(AA ... CRC前一字节) & 0xFF)
 
 ---
 
-## 5. AA 短帧：已破译规则
-
-### 5.1 帧结构
-
-```
-AA <cmd> <payload[1..6]> <crc> 55      （10 字节）
-```
-
-### 5.2 cmd → unit_id 映射（11/11 验证通过）
-
-**规则：`cmd = unit_id + 1`**
-
-| AA cmd | 对应 unit_id |
-|---|---|
-| 0x09 ~ 0x10 | 0x08 ~ 0x0F |
-| 0x29 ~ 0x2B | 0x28 ~ 0x2A |
-| 0x00 | 全局帧（无 unit_id） |
-
-### 5.3 payload 结构
-
-| 位置 | 含义 | 状态 |
-|---|---|---|
-| payload[1] | 有效标志：`0x02` = 有数据 / `0x00` = 空闲 | 已确认 |
-| payload[2] | **= 对应设备的 C1 byte7** | **已确认（同轮验证）** |
-| payload[3] | 疑似与 C1 byte9 同源 | **未确认**（实测常不一致） |
-| payload[4..6] | 常见为 `01 00 00` 或全零 | 未确认 |
-
-**实例**
-
-```
-AA 0A 02 20 18 01 00 00 BB 55     cmd=0x0A → unit 0x09
-   payload: 02 | 20 | 18 | 01 00 00
-              ↑    ↑
-           有数据  = C1 unit 0x09 的 byte7(0x20) ✓
-```
-
-**全局帧实例**
-
-```
-AA 00 02 1D 00 11 04 04 C8 55
-   payload: 02 | 1D | 00 | 11 04 04   （含义未确认）
-```
-
----
-
-## 6. C0 应答字段解码
+## 10. C0 应答字段解码
 
 32 字节布局（以 unit 0x08 实帧为例）：
 
@@ -243,401 +489,153 @@ AA C0 80 00 08 00 E0 14 A8 04 19 58 3A 3A FF FF
        AA C0 80 00 08 00 E0 14 A8 04 19 58 3A 3A FF FF
                           ↑  ↑  ↑  ↑  ↑  ↑  ↑  ↑  ↑
                         b7 b8 b9 b10 b11 T1 T2 T2B T3
-
-字节: 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32
-     ...
 ```
 
-### 6.1 字段表
+### 10.1 字段表
 
-| 字节 | 字段（codec 键名） | 含义 | 置信度 | 备注 |
+| 字节 | codec 键名 | 含义 | 置信度 | 备注 |
 |---|---|---|---|---|
 | 7 | `unknown_1` | 未知 | — | 全设备恒为 `0xE0` |
 | 8 | `caps` | 能力标志 | 高 | 全部为 `0x14`（0x10 摆风 + 0x04） |
-| 8 | `caps_sw` | 支持摆风 | 高 | bit4 |
-| 8 | `caps_extemp` | 支持 Follow-Me | 高 | bit7，智谷设备为 0 |
-| 9 | `op_mode` | 运行模式 | 中高 | `0x00`关 / `0x80`自动 / `0x88`制冷 / `0xA8`=0x88+bit5（HomeOps 未覆盖 bit5） |
+| 9 | `op_mode` | 运行模式 | 中高 | `0x00`关 / `0x80`自动 / `0x88`制冷 / `0xA8`=0x88+bit5 |
 | 10 | `fan_mode` | 风扇模式 | 高 | bit7=自动风，低 4 位=档位（`0x04`=低风） |
-| 10 | `fan_auto` / `fan_speed` | 自动风 / 档位 | 高 | 由 fan_mode 拆分 |
-| 11 | `target_temp_raw` | **设定温度** | 中（编码待定） | 实测 `0x15`~`0x19` → 疑似**直接 °C**（21~25℃） |
-| 12 | `t1_temp` | 室内回风温度 | **高** | `(x-0x28)/2` |
-| 13 | `t2_temp` | 盘管温度 | **高** | 同上；制冷时 8~12℃ 合理 |
+| 11 | `target_temp_raw` | 设定温度原始值 | 中 | 智谷设备疑似直接 °C（21~25℃） |
+| 12 | `t1_temp` | 室内回风温度 | **高** | `(x - 0x28) / 2` |
+| 13 | `t2_temp` | 盘管温度 | **高** | 同上；制冷时 8~12℃ |
 | 14 | `t2b_temp` | 盘管排温度 | 高 | 同上 |
 | 15 | `t3_temp` | 室外温度 | 高 | 恒为 `0xFF` → nil（内机不测） |
 | 16 | `current` | 电流 | 高 | 恒为 `0xFF`（内机不测） |
-| 17 | `unknown_2` | 未知 | — | 常为 `0x00` |
 | 18 | `timer_start` | 定时启动 | 高 | bitmask，0=未设置 |
 | 19 | `timer_stop` | 定时关机 | 高 | bitmask，0=未设置 |
-| 20 | `compressor_run` | 压缩机运行 | 中 | `0x01`=运行；**11 台全部为 1，属系统级共享状态** |
+| 20 | `compressor_run` | 压缩机运行 | 中 | `0x01`=运行；系统级共享状态 |
 | 21 | `mode_flags` | 模式标志 | 高 | bit0=ECO，bit1=AUX，bit2=摆风 |
 | 22 | `op_flags` | 运行标志 | 高 | bit2=水泵，bit7=水锁 |
 | 23-24 | `err_flags_low/high` | 故障标志 16bit | 高 | 0=无故障 |
 | 25-26 | `prot_flags_low/high` | 保护状态 16bit | 高 | bit1=除霜 |
 | 27 | `ccm_err` | CCM 通信错误 | 高 | 0=正常 / 1=超时 / 2=CRC错 / 4=协议错 |
-| 28 | `byte28` | **设备固有码** | 高 | 每台固定，与 C1 byte28 一致 |
+| 28 | `byte28` | 设备固有码 | 高 | 每台固定，与 C1 byte28 一致 |
 | 29-30 | `byte29/30` | 未知 | — | 恒为 `FF FF` |
 
-### 6.2 温度公式
+### 10.2 温度公式
 
 ```
 温度(℃) = (raw - 0x28) / 2.0
 raw = 0xFF → 表示无数据（nil）
 ```
 
-**验证依据**：unit 0x08 的 T2 在 `0x38~0x40` 波动 → 8~12℃，符合制冷盘管温度；
-若按直接摄氏度解释则为 56~64℃，不合理。
+验证：unit 0x08 的 T2 在 `0x38~0x40` 波动 → 8~12℃，符合制冷盘管温度。
 
-### 6.3 设定温度编码（重要待确认项）
+### 10.3 store 中对应的 tag
 
-HomeOps（美的系文档）用 `(raw-0x28)/2`，但直接套用会得到 **-7.5℃** 这类荒谬值。
+`xye_bridge.lua` 把 codec 字段名做了少量清洗后写入 store：
 
-实测所有设备的 byte11 取值：`0x15 / 0x17 / 0x18 / 0x19`，按**直接摄氏度**解释为
-`21 / 23 / 24 / 25 ℃`，非常合理。且整份抓包中始终不变（见 §9）。
-
-**结论：智谷设备的设定温度极可能是直接 °C，而非偏移公式。需现场改温验证。**
+| codec 字段 | → store tag | 说明 |
+|---|---|---|
+| `target_temp_raw` | `set_temp`（数值）+ `target_temp_raw`（原值） | byte11 清 bit6 得到实际温度；`0xFF` → nil |
+| `op_flags` bit2 | `op_waterpump` | 布尔 → 0/1 |
+| `mode_flags` bit0/1/2 | `mode_eco` / `mode_aux` / `mode_swing` | 布尔 → 0/1 |
+| `compressor_run == 1` | `compressor_run` | 1/0 |
+| `err_flags_high * 256 + err_flags_low` | `fault_code` | 高低字拼成 16bit |
+| `prot_flags_high * 256 + prot_flags_low` | `protect_code` | 高低字拼成 16bit |
+| 其他 | 同名 | 原值写入 |
 
 ---
 
-## 7. C1 应答：结构已知，语义未知
+## 11. C1 / AA 帧说明
 
-### 7.1 帧结构（32 字节）
+### 11.1 C1 应答
 
-```
-AA C1 80 00 <unit_id> 00 <status 24B> <crc> 55
-```
+**结构已知，语义未完全确认。** bridge 里只把 C1_RESP 作为"设备在线"的依据，**不写字段到 store**。
 
-### 7.2 已确认的结构
+已确认规律：
+- byte7（值 A）**= 对应设备 AA 短帧 payload[2]**（已验证 11/11）
+- byte28 = 设备固有码（与 C0 byte28 完全一致）
+- 值 A / 值 B 非零 ⟺ 室内机处于开机状态（11/11 成立）
 
-| 位置 | 含义 | 状态 |
-|---|---|---|
-| byte5 | unit_id | 确认 |
-| byte7 | 值 A | 与 AA 短帧 payload[2] 相同（**已核实**） |
-| byte8 | 分隔符 | 恒为 `0xFF` |
-| byte9 | 值 B | 语义未知 |
-| byte10 | 分隔符 | 恒为 `0xFF` |
-| byte11~26 | 业务载荷 | 本批抓包全为零 |
-| byte28 | 设备固有码 | **与 C0 byte28 完全一致** |
-| byte29-30 | — | 恒为 `FF FF` |
+### 11.2 AA 短帧
 
-### 7.3 已发现的规律
+**结构已知，bridge 完全忽略（不登记设备也不写字段）。**
 
-**值 A 与值 B 非零 ⟺ 该室内机处于开机状态，11/11 全部成立：**
+规则：`AA <cmd> <payload[1..6]> <crc> 55`，**`cmd = unit_id + 1`**。
 
-| unit | op_mode | C1 byte7(值A) | C1 byte9(值B) |
-|---|---|---|---|
-| 0x08 | 0xA8 开机 | 0x14 | 0x13 |
-| 0x09 | 0x88 开机 | 0x20 | 0x32 |
-| 0x0A | 0x88 开机 | 0x24 | 0x0E |
-| 0x0B | 0x00 关机 | 0x00 | 0x00 |
-| 0x0C | 0x00 关机 | 0x00 | 0x00 |
-| 0x0D | 0x00 关机 | 0x00 | 0x00 |
-| 0x0E | 0x88 开机 | 0x40 | 0x3C |
-| 0x0F | 0x00 关机 | 0x00 | 0x00 |
-| 0x28~0x2A | 0x00 关机 | 0x00 | 0x00 |
-
-**推断**：值 A / 值 B 是"运行态数值量"（候选：EEV 开度、风机实际转速、运行档位等），关机归零。
-
-**已排除**：值 B ≠ C1 byte9（同轮对比 unit 0x09 时，C1 byte9=0x32 而 AA payload[3]=0x18）。
-
-### 7.4 未确认部分
-
-- byte7 / byte9 具体物理量
-- byte11~26 全零区的用途
-- byte28 设备固有码的具体含义（候选：能力码 / 容量码，值域 `0x08/0x0A/0x0C/0x14/0x20/0x28`）
-
----
-
-## 8. Modbus 点位映射
-
-### 8.1 设计原则
-
-| 类型 | 功能码 | 能力 | 用途 |
-|---|---|---|---|
-| 离散输入 DI | 0x02 | **只读** | 是/否二值状态 |
-| 输入寄存器 IR | 0x04 | **只读** | 数值量 |
-
-> **当前所有点位均为只读。** DI/IR 在 Modbus 协议层面没有写功能码，
-> 要实现写必须改用线圈 / 保持寄存器，且 XYE 侧还要实现发送帧（见 §10）。
-
-### 8.2 点位划分
-
-**每台内机独立点位（11 套，`unit_points`）**
-
-| 类型 | 键 | 中文名 | 来源 | 缩放 |
-|---|---|---|---|---|
-| IR | `op_mode` | 运行模式 | C0 b9 | 原值 |
-| IR | `fan_mode` | 风扇模式 | C0 b10 | 原值 |
-| IR | `set_temp_raw` | 设定温度原始 | C0 b11 | 原值（编码待定） |
-| IR | `t1_temp` | 室内回风 | C0 b12 | ×10 |
-| IR | `t2_temp` | 盘管温度 | C0 b13 | ×10 |
-| IR | `t2b_temp` | 盘管排温度 | C0 b14 | ×10 |
-| IR | `fault` | 故障标志 | C0 b23-24 | 原值 |
-| IR | `protect` | 保护状态 | C0 b25-26 | 原值 |
-| IR | `device_code` | 设备固有码 | C0 b28 | 原值 |
-| IR | `c1_a` | 运行态值A | C1 b7 | 原值 |
-| IR | `c1_b` | 运行态值B | C1 b9 | 原值 |
-| DI | `pump` | 水泵运行 | C0 b22 bit2 | 0/1 |
-| DI | `eco` | ECO 节能 | C0 b21 bit0 | 0/1 |
-| DI | `aux` | 电辅热 | C0 b21 bit1 | 0/1 |
-| DI | `swing` | 摆风 | C0 b21 bit2 | 0/1 |
-
-**系统级共享点位（1 套，`system_points`）**
-
-| 类型 | 键 | 中文名 | 来源 | 说明 |
-|---|---|---|---|---|
-| DI | `compressor_run` | 压缩机运行 | C0 b20 | 全系统共享 |
-| IR | `t3_temp` | 室外温度 | C0 b15 | 常为无数据 |
-| IR | `ccm_err` | CCM 通信错误 | C0 b27 | — |
-
-### 8.3 地址分配规则
-
-```
-IR 地址 = unit_index * IR_STRIDE + 点内偏移     (IR_STRIDE = 11)
-DI 地址 = unit_index * DI_STRIDE + 点内偏移     (DI_STRIDE = 4)
-系统点位排在全部内机点位之后
-```
-
-`unit_index` 顺序（固定）：
-
-```
-0x08=0, 0x09=1, 0x0A=2, 0x0B=3, 0x0C=4, 0x0D=5,
-0x0E=6, 0x0F=7, 0x28=8, 0x29=9, 0x2A=10
-```
-
-### 8.4 实际地址表（已现场验证）
-
-| 设备 | IR 地址段 | DI 地址段 |
-|---|---|---|
-| 0x08 | 0x0000 ~ 0x000A | 0x0000 ~ 0x0003 |
-| 0x09 | 0x000B ~ 0x0015 | 0x0004 ~ 0x0007 |
-| 0x0A | 0x0016 ~ 0x0020 | 0x0008 ~ 0x000B |
-| 0x0B | 0x0021 ~ 0x002B | 0x000C ~ 0x000F |
-| 0x0C | 0x002C ~ 0x0036 | 0x0010 ~ 0x0013 |
-| 0x0D | 0x0037 ~ 0x0041 | 0x0014 ~ 0x0017 |
-| 0x0E | 0x0042 ~ 0x004C | 0x0018 ~ 0x001B |
-| 0x0F | 0x004D ~ 0x0057 | 0x001C ~ 0x001F |
-| 0x28 | 0x0058 ~ 0x0062 | 0x0020 ~ 0x0023 |
-| 0x29 | 0x0063 ~ 0x006D | 0x0024 ~ 0x0027 |
-| 0x2A | 0x006E ~ 0x0078 | 0x0028 ~ 0x002B |
-| 系统级 | 0x0079 ~ 0x007A | 0x002C |
-| **合计** | **IR 123 个** | **DI 45 个** |
-
-### 8.5 内机点位在段内的顺序
-
-```
-IR 段内偏移: 0=运行模式 1=风扇模式 2=设定温度原始 3=室内回风
-             4=盘管温度 5=盘管排温度 6=故障标志 7=保护状态
-             8=设备固有码 9=运行态值A 10=运行态值B
-DI 段内偏移: 0=水泵 1=ECO 2=电辅热 3=摆风
-```
-
----
-
-## 9. 原始抓包分析结论
-
-数据源：`01_抓包/0907智谷-feiyi室内外机报文-连智谷室内外机_开始连反了.txt`
-
-### 9.1 命令统计
-
-| 命令 | 出现 | 结论 |
-|---|---|---|
-| 0xC0 查询 | 约 7060 行 | 主站持续轮询 |
-| 0xC1 查询 | 2068 行 | 主站查询扩展状态 |
-| 0xC3 SET | **0** | 无任何设置动作 |
-| 0xC4 / 0xC6 / 0xCC / 0xCD | **0** | 无扩展查询 / Follow-Me / 锁定 |
-
-**结论：整份抓包约 94 轮、约 21 分钟，CCM 全程只查询，从未设置任何值。**
-
-### 9.2 稳态验证（unit 0x08 全程 12 个采样点）
-
-| 字段 | 变化情况 |
+| AA cmd | 对应 unit_id |
 |---|---|
-| 运行模式 b9 | 恒为 `0xA8` |
-| 风速 b10 | 恒为 `0x04` |
-| **设定值 b11** | **恒为 `0x19`（25℃）** |
-| 模式标志 b21 | 恒为 `0x00` |
-| 运行标志 b22 | 恒为 `0x14` |
-| 故障 / 保护 | 恒为 `0x0000` |
-| T1 / T2 / T2B | 自然波动（真实温度变化） |
+| 0x09 ~ 0x10 | 0x08 ~ 0x0F |
+| 0x29 ~ 0x2B | 0x28 ~ 0x2A |
+| 0x00 | 全局帧（无 unit_id） |
 
-**结论：稳态运行，设定值从未被改动；只有温度传感器读数在变。**
-
-### 9.3 由此得到的两点佐证
-
-1. **温度偏移公式成立**：T2 在 `0x38~0x40` → 8~12℃，符合制冷盘管温度。
-2. **设定温度是直接 °C**：b11 恒为 `0x19`=25℃，与 T1 按偏移公式算出的 25℃ 含义不同，
-   证明 b11 的 25 是 25℃ 本身。
+payload[1] 是有效标志：`0x02`=有数据 / `0x00`=空闲。
 
 ---
 
-## 10. 写入能力分析（暂不实现）
+## 12. 离线判定
 
-### 10.1 现状
+**45 秒**无应答判离线。实现位置：`xye_protocol/xye_bridge.lua` 里的 `offline_task()`。
 
-当前 Modbus 点位全部是 DI / IR，**协议层面只读**，没有任何值可写。
-
-### 10.2 XYE 侧存在的写命令（HomeOps 文档）
-
-| 命令 | 值 | 作用 |
-|---|---|---|
-| QUERY | 0xC0 | 查基本状态 |
-| QUERY_EXTENDED | 0xC4 | 查扩展状态 |
-| **SET** | **0xC3** | 设置模式 / 风速 / 温度 |
-| FOLLOW_ME | 0xC6 | 上报远程温度（跟随模式） |
-| LOCK / UNLOCK | 0xCC / 0xCD | 锁定 / 解锁面板按键 |
-
-发送帧为 **16 字节**，与接收帧格式不同：
-**byte13 = `0xFF - Command`（补码），byte14 = CRC**。
-
-### 10.3 可写性分类
-
-| 字段 | 可写 | 依据 |
-|---|---|---|
-| 运行模式 | ✅ | 0xC3 |
-| 风扇模式 | ✅ | 0xC3 |
-| 设定温度 | ✅ | 0xC3 |
-| 摆风 / ECO / 电辅热 | ✅ | 0xC3（发送帧 byte11） |
-| 定时启动/关机 | ✅ | 0xC3（发送帧 byte9-10） |
-| 面板锁定 | ✅ | 0xCC / 0xCD |
-| Follow-Me 远程温度 | ❌ | 0xC6，但本设备 `caps_extemp=0`，不支持 |
-| T1/T2/T2B/T3 | ❌ | 传感器实测 |
-| 故障 / 保护 | ❌ | 状态位 |
-| 压缩机运行 | ❌ | 系统状态 |
-| 设备固有码 | ❌ | 只读属性 |
-| C1 值A/值B | ❌ | 语义未知且为状态量 |
-| 水泵运行 | ❌ | 状态反馈 |
-
-**规律：可写的是"设定值/控制量"，不可写的是"测量值/状态量"。**
-
-### 10.4 实现写功能的前置条件
-
-1. **Modbus 层**：改用保持寄存器（0x03/0x06/0x10）或线圈（0x01/0x05）
-2. **XYE 发送层**：构造 16 字节发送帧（byte13 补码 + byte14 CRC），当前 codec 只有解析、无组帧
-3. **RS485 时序层**：u1 方向脚 GPIO25 收发切换；只能在每轮约 1.82s 的静默窗口发送，避免与 CCM 撞车
-
-### 10.5 为什么现在不能做
-
-| 风险 | 说明 |
+| 条件 | 动作 |
 |---|---|
-| 缺乏样板 | 抓包中 **0xC3 帧为 0**，没有真实写帧可供学习字节布局 |
-| 文档不可靠 | HomeOps 为美的系文档，智谷已实测多处偏离（mode 0xA8、设定温度编码） |
-| 总线冲突 | 总线上有 CCM 主站持续轮询，第三方插话存在冲突风险 |
-| 硬件前提未验证 | 1.md P4 列出：静默期是否真空闲、CCM 是否覆写、从机是否接受第三方命令 |
+| 收到 C0_RESP 或 C1_RESP | `seen_ms[unit_id] = mcu.ticks()`（刷新在线时间） |
+| 连续 45s 未收到任何应答 | 从 `seen_ms` 移除 → `store.write_device_offline(unit_id, 0x0B)` |
 
-**建议路径**：先完成 P3 差分分析 → 再抓一份"有人操作面板"的报文 → 用真实 0xC3 帧反推布局 → 最后才考虑开放写。
+离线后 store 中该设备的**所有点位 errcode 被置 0x0B**（Modbus "目标设备无响应"，与二合一 store 保持一致），上报时质量位 `q="0"`，服务端不存储。
 
 ---
 
-## 11. 测试方法
+## 13. 为后续扩展预留
 
-### 11.1 发多少帧
+### 13.1 加 Modbus 协议转换
 
-| 目的 | 帧数 | 能看到 |
+当前工程**故意不做** tag → s_addr 映射。以后加时：
+
+1. 新建 `modbus_profile.lua`：`{ op_mode = 0x0000, t1_temp = 0x0001, ... }`
+2. 新建 `modbus_slave.lua`：收到上位机读寄存器请求 → 查 store → 按映射表返回值
+3. **store.lua 和 xye_bridge.lua 完全不动**
+
+### 13.2 加 XYE 写入 / 控制
+
+当前 bridge 只处理 C0_RESP / C1_RESP，listener 的方向脚固定低。以后加时：
+
+1. codec 里补 C3 SET 帧的组帧函数（16 字节，byte13 补码 + byte14 CRC）
+2. listener 增加方向脚切换（GPIO25 高电平发送，发完拉低）
+3. bridge 在每轮约 1.82s 的静默窗口发送，避免与 CCM 主站撞车
+4. store.set_by_tag() 里实现"写 tag → 组 C3 帧 → 发送"逻辑
+
+### 13.3 加板型切换
+
+当前所有引脚硬编码，config.lua 无 `point_table_id`。以后加多板型时：
+
+1. 新建 `board.lua` 按 `rtos.bsp()` 返回 profile
+2. 所有硬编码引脚改从 board.profile 取
+3. config.lua 加 `point_table_id` 并按板型过滤参数白名单
+
+---
+
+## 14. 已知坑
+
+| # | 坑 | 解决 |
 |---|---|---|
-| 快速冒烟 | 20~30 | 首台设备上线、字段解码 |
-| 完整一轮 | 109 | 11 台设备、四类帧齐全 |
-| **推荐** | **150** | 一轮 + 部分第二轮，11 台全部出点位表 |
-| 看完整 AA（12 帧） | 250 | 补齐 0x09/0x0B/0x0D/0x0F 四个 AA cmd |
-
-### 11.2 日志标签
-
-| 标签 | 内容 |
-|---|---|
-| `main` | 启动横幅（工程名、版本） |
-| `xye` | listener 初始化（串口参数） |
-| `XYE` | 帧统计、设备上线、C0/C1/AA 详情 |
-| `PMAP` | Modbus 点位表快照 |
-| `TEST` / `DIAG` | 临时的 codec 单测 / 校验诊断（已移除） |
-
-### 11.3 验收指标
-
-| 指标 | 期望 |
-|---|---|
-| UNKNOWN 帧数 | **0** |
-| 在线设备 | **11 台**（0x08~0x0F + 0x28~0x2A） |
-| 设备固有码 b28 | 与 C1 byte28 一致 |
-| 运行态值A | 与 AA payload[2] 一致 |
-| 水泵 DI | 开机设备=1，关机设备=0 |
-
-### 11.4 典型预期日志
-
-```
-===== Modbus 点表 单元ID=0x08 =====
-  IR[0x0000] 运行模式 = 168
-  IR[0x0001] 风扇模式 = 4
-  IR[0x0002] 设定温度原始 = 25
-  IR[0x0003] 室内回风 = 240 (÷10=24.0)
-  IR[0x0004] 盘管温度 = 90 (÷10=9.0)
-  IR[0x0005] 盘管排温度 = 90 (÷10=9.0)
-  IR[0x0006] 故障标志 = 0
-  IR[0x0007] 保护状态 = 0
-  IR[0x0008] 设备固有码 = 20
-  IR[0x0009] 运行态值A = 20
-  IR[0x000A] 运行态值B = 19
-  DI[0x0000] 水泵运行 = 1/是
-  DI[0x0001] ECO节能 = 0/否
-  DI[0x0002] 电辅热 = 0/否
-  DI[0x0003] 摆风 = 0/否
-```
+| 1 | 校验含 0x55 导致全部帧校验失败 | 校验范围止于 CRC，不含末尾 0x55 |
+| 2 | C1 应答被误判为 30 字节 | 实际 32 字节，按 32 字节校验 |
+| 3 | C0_POLL 里的 unit_id ≠ 设备在线 | 只认 C0_RESP / C1_RESP 应答帧 |
+| 4 | AA short frame payload[1] 不是固定头 | 它是有效标志 `0x02`/`0x00` |
+| 5 | AA payload[2] 才是 C1 byte7 的镜像 | 容易差一位（曾误标为 payload[1]） |
+| 6 | `string.format` 占位符与参数数量必须一致 | 曾因占位符 4 个参数 2 个导致 Lua VM 崩溃重启 |
+| 7 | 压缩机运行是系统级共享状态 | 11 台全部为 1，不要按内机独立点位理解 |
+| 8 | 设定温度不能用 `(raw-0x28)/2` | 智谷设备疑似直接 °C，套偏移公式会出负数 |
+| 9 | `report_real_enable` / `change_enable` 默认是 false | 需要平台下发开启，否则整点不会上报 |
+| 10 | NTP 校时前 os.time() 停在 2000 年 | report.lua 里 `TIME_VALID_MIN=1600000000` 门控拦住假时间戳 |
+| 11 | 时钟跳变（NTP 校时瞬间跨 20+ 年） | report.lua 检测到 `cur_boundary < last_real_ts` 时重置基准，跳过假整点上报 |
+| 12 | config 文件存在时新增 key 不会自动追加 | `config.lua` 的 `get()` 做了 fallback 默认值，但落盘的文件里旧 key 还是缺；要么手动删 `/gateway_cfg.json` 让它重写，要么加迁移逻辑 |
 
 ---
 
-## 12. 进度与下一步
-
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| **P1** | 拆帧 + 串口旁听 + 在线设备列表 | ✅ 完成（0 校验错，11 台） |
-| **P2** | 已知字段解码 + Modbus 点位映射 | ✅ 完成（点位表现场验证） |
-| **P3** | C1 / AA 语义破译（差分分析） | ⏳ 待现场实验 |
-| **P4** | 空档写入台架试验 | ⛔ 默认关闭，前置条件未满足 |
-| **P5** | 三模块无外部依赖、可整体移植 | ✅ 满足 |
-
-### P3 待做实验（需现场配合）
-
-对一台开机设备（推荐 0x08）逐项操作，每次动作前后各抓一轮，对比 C1 全 payload 与 C0 的逐字节变化：
-
-| 实验 | 观察目标 |
-|---|---|
-| 关机 → 开机 | 值A/值B 归零与恢复规律 |
-| 切换 制冷/制热/送风 | 哪个字节跟随模式变化 |
-| 设定温度 +2℃ | b11 是否按 +2 变化（验证直接 °C） |
-| 风扇档位 低→高 | fan_mode 与值A/值B 的关系 |
-| 开/关摆风 | b21 bit2 |
-| 触发故障（拔传感器等） | b23-24 故障位图 |
-
----
-
-## 13. 已知坑与注意事项
-
-1. **校验不能含 0x55**：校验范围是 `AA ... CRC`，末尾 `0x55` 不计入。否则全部帧校验失败。
-2. **C1 应答是 32 字节**，不是文档写的 30 字节。
-3. **在线判定只认应答帧**：C0_POLL / C1_POLL 里的 unit_id 不代表设备在线。
-4. **AA 短帧 payload[1] 不是固定头**：它是有效标志，`0x02`=有数据 / `0x00`=空闲。
-5. **AA payload[2] 才是 C1 byte7 的镜像**，容易差一位（曾误标为 payload[1]）。
-6. **`string.format` 占位符与参数数量必须一致**：曾因 `E1/E2` 写了 4 个占位符只传 2 个参数导致 Lua VM 崩溃重启。
-7. **压缩机运行是系统级状态**：11 台全部为 1，不要按内机独立点位理解。
-8. **设定温度不能用 `(raw-0x28)/2`**：会解出负数，智谷设备疑似直接 °C。
-
----
-
-## 14. 参考资料
+## 15. 参考资料
 
 | 文件 | 用途 |
 |---|---|
-| `_extra/1.md` | 前期架构讨论与实施计划（P1~P5） |
+| `_extra/Air780_EPM_EHV/*` | 二合一参考工程（MQTT 协议、上报逻辑、OTA、设备支撑模块） |
 | `_extra/.../02_协议参考/HomeOps/PROTOCOL.md` | 美的系 XYE 协议文档（命令表、C0 字段、CRC） |
-| `_extra/.../02_协议参考/智谷美的XYE现场参考.md` | 现场差异说明（明确 C1/AA 语义待确认） |
-| `_extra/.../03_样例/paired_examples.json` | 成对样例帧 |
-| `_extra/.../01_抓包/0907智谷-*.txt` | 约 10256 帧原始抓包（仅 C0/C1/AA） |
-| `_extra/Air780_EPM_EHV/*` | 参考工程（串口写法、日志风格，勿直接复用网关逻辑） |
+| `_extra/.../02_协议参考/智谷美的XYE现场参考.md` | 现场差异说明 |
+| `_extra/.../01_抓包/*.txt` | 原始抓包（约 10256 帧，仅 C0/C1/AA） |
 
 > `_extra/` 已在 `.gitignore` 中忽略，不纳入版本管理。
-
----
-
-## 15. 通讯与日志约定
-
-- 所有串口通信集中由 `xye_listener.lua` 管理，其他模块不直接调 `uart`
-- `xye_codec.lua` / `xye_profile.lua` 为纯逻辑，禁止 require 硬件模块
-- 日志统一走 `log.info/error/warn`，模块 tag 使用 `XYE` / `PMAP` / `xye`
-- 事件与数据分离：解码结果以 table 形式回调，不在 codec 内打印
