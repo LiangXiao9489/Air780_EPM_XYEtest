@@ -27,38 +27,11 @@ log.error("main", "固件版本: " .. VERSION)
 log.error("main", "====================================================")
 log.error("main", "====================================================")
 
--- ========== store 缓存层启动测试（临时，步骤3通过后删除） ==========
-log.info("store.test", "===== store 缓存层启动测试 =====")
-store.ensure_device(0x08)
-store.write_point(0x08, "op_mode", 1, 0)
-store.write_point(0x08, "t1_temp", 26, 0)
-store.write_point(0x08, "compressor_run", 1, 0)
-store.ensure_device(0x09)
-store.write_point(0x09, "op_mode", 0, 0)
-store.write_point(0x09, "t1_temp", 28, 0)
-store.write_point(0x09, "fault_code", 0, 0)
-log.info("store.test", "is_ready=", store.is_ready())
-log.info("store.test", "online_devices=", table.concat(store.get_online_devices(), ","))
-local vals = store.get_point_values()
-log.info("store.test", "get_point_values 返回条数=" .. #vals)
-for _, p in ipairs(vals) do
-    log.info("store.test", string.format("  dev=0x%02X tag=%-16s value=%s errcode=0x%02X ts=%s",
-        p.dev_id, p.tag, tostring(p.values and p.values[1]), p.errcode, tostring(p.ts)))
-end
--- 测试离线
-store.write_device_offline(0x09, 0x0B)
-local v2 = store.get_point_values()
-local offline_count = 0
-for _, p in ipairs(v2) do
-    if p.dev_id == 0x09 and p.errcode == 0x0B then offline_count = offline_count + 1 end
-end
-log.info("store.test", string.format("离线测试: 0x09 设备 errcode=0x0B 的点位=%d", offline_count))
-log.info("store.test", "===== store 测试完成 =====")
 
--- ========== XYE Listener 硬件测试 ==========
+-- ========== XYE Listener + Bridge ==========
 local listener = require "xye_listener"
 local codec    = require "xye_codec"
-local profile  = require "xye_profile"
+local bridge   = require "xye_bridge"
 
 -- 统计
 local total_frames = 0
@@ -66,17 +39,15 @@ local frame_count = {}         -- ftype -> count
 local online_units = {}        -- unit_id -> { last_seen_tick, ftypes }
 local unknown_count = 0
 
--- sink: 每收到一帧就回调
+-- sink: 每收到一帧就回调（bridge 负责写 store，这里负责统计和首次全量打印）
 local printed_units = {}   -- 已全量打印过 C0 字段的设备 unit_id
 local printed_c1    = {}   -- 已打印过 C1 结构的设备 unit_id
 local printed_aa    = {}   -- 已打印过的 AA 短帧 cmd
 
--- Modbus 点位映射所需
-local latest      = {}     -- unit_id -> { c0 = fields, c1 = fields }
-local printed_pm  = {}     -- 已打印过 Modbus 点表的设备
-local printed_sys = false  -- 系统级点表是否已打印
-
 local function on_frame(frame)
+    -- bridge 写 store（最优先，保证缓存层先拿到数据）
+    bridge.on_frame(frame)
+
     total_frames = total_frames + 1
 
     -- 帧类型计数
@@ -128,20 +99,19 @@ local function on_frame(frame)
             log.info("XYE", "  =========================================================")
         end
 
-        -- 每台设备第一次收到 C1_RESP 时打印结构化原始数据（语义待 P3 差分）
+        -- 每台设备第一次收到 C1_RESP 时打印结构化原始数据
         if frame.ftype == "C1_RESP" and frame.fields and not printed_c1[id] then
             printed_c1[id] = true
             local c = frame.fields
             log.info("XYE", string.format("-------- C1_RESP 结构 单元ID=0x%02X --------", id))
             log.info("XYE", string.format("  原始帧HEX: %s", codec.to_hex(frame.raw)))
-            log.info("XYE", string.format("  值A(byte7)=0x%02X  值B(byte9)=0x%02X  设备固有(byte28)=0x%02X  (sentinel b8=0x%02X b10=0x%02X)",
-                c.val_a, c.val_b, c.dev_const, c.sentinel_1, c.sentinel_2))
+            log.info("XYE", string.format("  值A(byte7)=0x%02X  值B(byte9)=0x%02X  设备固有(byte28)=0x%02X",
+                c.val_a, c.val_b, c.dev_const))
             log.info("XYE", string.format("  payload原值(b6..b30): %s", c.payload_hex))
-            log.info("XYE", "  (语义未确认，待 P3 差分分析)")
         end
     end
 
-    -- AA 短帧：每个 cmd 只打印一次（cmd = unit_id + 1）
+    -- AA 短帧：每个 cmd 只打印一次
     if frame.ftype == "AA" and frame.fields and not printed_aa[frame.fields.cmd] then
         printed_aa[frame.fields.cmd] = true
         local a = frame.fields
@@ -153,75 +123,6 @@ local function on_frame(frame)
         log.info("XYE", string.format("  原始帧HEX: %s", codec.to_hex(frame.raw)))
         log.info("XYE", string.format("  payload原值: %s%s", a.payload_hex,
             a.all_zero and "  (全零 = 该槽位空闲/无数据)" or ""))
-        if a.unit_id then
-            log.info("XYE", string.format("  标志=0x%02X  值A(payload[2]↔C1 byte7)=0x%02X  值B(payload[3])=0x%02X  尾=0x%02X 0x%02X 0x%02X",
-                a.p1, a.p2, a.p3, a.p4, a.p5, a.p6))
-        else
-            log.info("XYE", string.format("  标志=0x%02X  payload[2..6]=0x%02X 0x%02X 0x%02X 0x%02X 0x%02X",
-                a.p1, a.p2, a.p3, a.p4, a.p5, a.p6))
-        end
-    end
-
-    -- ===== Modbus 点位映射 =====
-    local uid = frame.unit_id
-    if uid and frame.fields then
-        local slot = latest[uid]
-        if not slot then
-            slot = {}
-            latest[uid] = slot
-        end
-        if frame.ftype == "C0_RESP" then
-            slot.c0 = frame.fields
-        elseif frame.ftype == "C1_RESP" then
-            slot.c1 = frame.fields
-        end
-
-        -- 每台内机：C0 + C1 都到齐后打印一次点位表
-        if slot.c0 and slot.c1 and not printed_pm[uid] then
-            printed_pm[uid] = true
-            log.info("PMAP", string.format("===== Modbus 点表 单元ID=0x%02X =====", uid))
-            for _, p in ipairs(profile.unit_points) do
-                local fields = (p.src == "c1") and slot.c1 or slot.c0
-                local addr = profile.unit_addr(p, uid)
-                if addr then
-                    local v = profile.point_value(p, fields)
-                    local vs
-                    if v == nil then
-                        vs = "(无数据)"
-                    elseif p.kind == "DI" then
-                        vs = (v == 1) and "1/是" or "0/否"
-                    elseif p.scale then
-                        vs = string.format("%d (÷%d=%.1f)", v, p.scale, v / p.scale)
-                    else
-                        vs = tostring(v)
-                    end
-                    log.info("PMAP", string.format("  %s[0x%04X] %s = %s", p.kind, addr, p.cn, vs))
-                end
-            end
-        end
-    end
-
-    -- 系统级共享点位：首次拿到任一 C0 帧后打印一次
-    if not printed_sys and frame.ftype == "C0_RESP" and frame.fields then
-        printed_sys = true
-        log.info("PMAP", "===== Modbus 点表（系统级共享）=====")
-        for _, p in ipairs(profile.system_points) do
-            local addr = profile.sys_addr(p)
-            local v = profile.point_value(p, frame.fields)
-            local vs
-            if v == nil then
-                vs = "(无数据)"
-            elseif p.kind == "DI" then
-                vs = (v == 1) and "1/是" or "0/否"
-            elseif p.scale then
-                vs = string.format("%d (÷%d=%.1f)", v, p.scale, v / p.scale)
-            else
-                vs = tostring(v)
-            end
-            log.info("PMAP", string.format("  %s[0x%04X] %s = %s", p.kind, addr, p.cn, vs))
-        end
-        log.info("PMAP", string.format("  地址空间: IR 共 %d 个, DI 共 %d 个",
-            profile.IR_TOTAL, profile.DI_TOTAL))
     end
 
     if frame.ftype:sub(1, 7) == "UNKNOWN" then
@@ -232,8 +133,9 @@ local function on_frame(frame)
     end
 end
 
-listener.set_sink(on_frame) 
+listener.set_sink(on_frame)
 listener.init()
+bridge.start()
 
 -- 每 5 秒打印一次统计
 sys.timerLoopStart(function()
@@ -247,7 +149,13 @@ sys.timerLoopStart(function()
     for id, _ in pairs(online_units) do ids[#ids+1] = string.format("0x%02X", id) end
     table.sort(ids)
     log.error("XYE", string.format("  在线设备 (%d台): %s", #ids, table.concat(ids, " ")))
+
+    -- store 缓存层验证
+    if store.is_ready() then
+        local sids = store.get_online_devices()
+        local spoints = store.get_point_values()
+        log.info("XYE", string.format("  store: 设备=%d台  点位=%d个", #sids, #spoints))
+    end
 end, 5000)
--- ========== XYE Listener 硬件测试结束 ==========
 
 sys.run()
